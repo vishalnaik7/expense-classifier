@@ -36,8 +36,13 @@ class CSVParser:
         'credit': ['credit', 'deposit']
     }
     
-    # Minimum required columns
-    REQUIRED_COLUMNS = ['date', 'description', 'amount']
+    # Minimum required columns. 'amount' is checked specially in
+    # _validate_headers() rather than listed here directly: a split
+    # debit/credit layout can satisfy the "there's a debit-side amount"
+    # requirement via either an 'amount' column or a 'debit' column,
+    # depending on which literal word that bank's header used (see
+    # _resolve_amount_and_type()).
+    REQUIRED_COLUMNS = ['date', 'description']
 
     # How many leading rows to scan for a real header when the first row
     # turns out to be bank metadata (e.g. "STATEMENT OF ACCOUNT", account
@@ -206,16 +211,21 @@ class CSVParser:
     
     def _validate_headers(self) -> None:
         """
-        Validate that all required columns are present
-        
+        Validate that all required columns are present. A debit-side
+        amount column is required too, but - matching
+        _resolve_amount_and_type() - it may appear as either 'amount' or
+        'debit' depending on which literal word the source header used
+        (e.g. HDFC's "Withdrawal Amt." normalizes to 'debit', not
+        'amount'), so neither alone is treated as strictly required.
+
         Raises:
             CSVParsingError: If required columns are missing
         """
-        missing_columns = []
-        for required in self.REQUIRED_COLUMNS:
-            if required not in self.df.columns:
-                missing_columns.append(required)
-        
+        missing_columns = [c for c in self.REQUIRED_COLUMNS if c not in self.df.columns]
+
+        if 'amount' not in self.df.columns and 'debit' not in self.df.columns:
+            missing_columns.append('amount (or debit)')
+
         if missing_columns:
             raise CSVParsingError(
                 f'Missing required columns: {", ".join(missing_columns)}. '
@@ -348,15 +358,22 @@ class CSVParser:
 
         Bank exports come in two shapes: a single 'amount' column (this
         parser always treats that as a debit/expense), or a split
-        Debit/Credit pair - after header normalization that leaves both an
-        'amount' column (from Debit) and a 'credit' column on the row, with
-        exactly one of them populated per transaction. Use whichever one
-        actually has a positive value for this row.
+        debit/credit pair. After header normalization a split layout can
+        land as either an 'amount' + 'credit' column (when the debit-side
+        header literally contains "debit", e.g. IDFC's "Debit") or a
+        'debit' + 'credit' column (when it uses a synonym instead, e.g.
+        HDFC's "Withdrawal Amt." / "Deposit Amt.", matched via
+        HEADER_PATTERNS['debit'] = ['debit', 'withdrawal']) - so both the
+        'amount' and 'debit' columns need to be checked as possible
+        sources for the debit side, not just 'amount'. Use whichever
+        column actually has a positive value for this row.
 
         Raises:
-            ValueError: if neither column has a usable positive amount
+            ValueError: if no column has a usable positive amount
         """
         debit_amount = self._to_positive_float(row.get('amount') if 'amount' in row.index else None)
+        if debit_amount is None and 'debit' in row.index:
+            debit_amount = self._to_positive_float(row.get('debit'))
         if debit_amount is not None:
             return debit_amount, 'debit'
 
@@ -365,7 +382,12 @@ class CSVParser:
             if credit_amount is not None:
                 return credit_amount, 'credit'
 
-        raw_value = row.get('amount') if 'amount' in row.index else None
+        if 'amount' in row.index:
+            raw_value = row.get('amount')
+        elif 'debit' in row.index:
+            raw_value = row.get('debit')
+        else:
+            raw_value = None
         raise ValueError(f'Invalid amount: "{raw_value}". Must be a valid positive number')
 
     @staticmethod

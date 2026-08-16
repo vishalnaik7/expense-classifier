@@ -17,9 +17,10 @@ gets exactly the same date-format support, duplicate hashing, and
 CSV-injection sanitization as a CSV upload, with only one place that
 logic needs to be correct.
 
-extract_raw_text() is the fallback path: when the PDF has no
-machine-readable table grid (e.g. it's a flattened/scanned layout),
-CSVParser has nothing to parse, so the caller should fall back to the
+extract_raw_text() is the fallback path: when the deterministic table
+extraction above couldn't confidently find/recognize a transaction table
+(an unfamiliar bank's column naming, or a genuinely flattened/scanned
+layout with no table grid at all), the caller should fall back to the
 existing LLM extractor (services/llm_extractor.py) with this raw text
 instead, exactly as it already does for CSVs the deterministic parser
 can't make sense of.
@@ -43,10 +44,19 @@ def _looks_like_header_row(row: List[Optional[str]]) -> bool:
     Does this extracted table row look like the transaction table's header
     (not the small Opening/Total Debit/Total Credit/Closing Balance summary
     block that most bank statement PDFs print above it)?
+
+    Different banks name the amount columns differently - IDFC FIRST uses
+    "Debit"/"Credit", HDFC uses "Withdrawal Amt."/"Deposit Amt." - so this
+    checks a broader set of synonyms rather than just "debit"/"credit"/
+    "amount", to avoid silently failing to even recognize the header on a
+    bank format this hasn't specifically been tested against before.
     """
     cells = [str(c or '').strip().lower() for c in row]
     has_date = any('date' in c for c in cells)
-    has_amount = any(h in c for c in cells for h in ('debit', 'credit', 'amount'))
+    has_amount = any(
+        h in c for c in cells
+        for h in ('debit', 'credit', 'amount', 'withdrawal', 'deposit')
+    )
     has_description = any(h in c for c in cells for h in ('particulars', 'narration', 'description'))
     return has_date and has_amount and has_description
 
@@ -104,12 +114,40 @@ def extract_transaction_csv(file_content: bytes) -> str:
 
 
 def extract_raw_text(file_content: bytes) -> str:
-    """Plain-text extraction across all pages, for the AI fallback path when table extraction fails."""
+    """
+    Best-effort extraction for the AI fallback path, used when
+    extract_transaction_csv() couldn't confidently locate/recognize a
+    transaction table on its own (e.g. an unfamiliar bank's column
+    naming). Prefers each page's raw table-cell grid - preserving column
+    alignment, even for a header this module's own heuristic doesn't
+    recognize - over plain linearized text, since a language model can
+    map an unfamiliar header like "Withdrawal Amt." to a debit column far
+    more reliably than word-position-based text extraction can, but only
+    if it can actually see the columns rather than a jumbled line of text
+    where a wide table's cells were interleaved out of order. Falls back
+    to plain text extraction only for pages with no detectable table grid
+    at all (e.g. a scanned/flattened layout).
+    """
     if not file_content:
         raise PDFParsingError('File content is empty')
     try:
         with pdfplumber.open(io.BytesIO(file_content)) as pdf:
-            return '\n'.join(page.extract_text() or '' for page in pdf.pages)
+            page_blocks = []
+            for page_num, page in enumerate(pdf.pages, start=1):
+                tables = page.extract_tables()
+                if tables:
+                    lines = [f'--- Page {page_num} ---']
+                    for table in tables:
+                        for row in table:
+                            cells = ['' if cell is None else str(cell).replace('\n', ' ').strip() for cell in row]
+                            if any(cells):
+                                lines.append(' | '.join(cells))
+                    page_blocks.append('\n'.join(lines))
+                else:
+                    text = (page.extract_text() or '').strip()
+                    if text:
+                        page_blocks.append(f'--- Page {page_num} ---\n{text}')
+            return '\n\n'.join(page_blocks)
     except Exception as e:
         raise PDFParsingError(f'Could not read PDF file: {e}')
 

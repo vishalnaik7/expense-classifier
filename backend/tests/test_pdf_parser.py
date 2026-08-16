@@ -144,9 +144,57 @@ def test_seven_column_layout_with_wrapped_narration_cells_like_a_real_statement(
     assert 'pinelab' in irctc['description']
 
 
+def test_hdfc_style_withdrawal_deposit_headers_are_recognized():
+    # HDFC statements use "Withdrawal Amt." / "Deposit Amt." instead of
+    # "Debit" / "Credit" - _looks_like_header_row() must recognize this as
+    # a header, and CSVParser must resolve amounts from the resulting
+    # 'debit'-named column (see the matching csv_parser.py regression test).
+    header = ['Date', 'Narration', 'Chq./Ref.No.', 'Value Dt', 'Withdrawal Amt.', 'Deposit Amt.', 'Closing Balance']
+    rows = [
+        ['05/05/26', 'ACH D- HDFC BANK LTD-459198206', '0000002039555125', '05/05/26', '11,611.00', '', '9,525.05'],
+        ['09/05/26', 'UPI-VODAFONE IDEA\nMAHAR-VIINAPPMAG@YBL-\nYESB0YBLUPI-529452803453-PAYMENT FROM PHONE',
+         '0000529452803453', '09/05/26', '33.00', '', '9,492.05'],
+        ['31/05/26', 'UPI-VISHAL DASHARATH NAI-9821948908@YBL-\nIDFB0040101-960934191163-PAYMENT FROM PHONE',
+         '0000960934191163', '31/05/26', '', '15,000.00', '24,410.00'],
+    ]
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter)
+    doc.build([Table([header] + rows, style=_GRID_STYLE)])
+
+    transactions = parse(buffer.getvalue())
+
+    assert len(transactions) == 3
+    vodafone = next(t for t in transactions if 'VODAFONE' in t['description'])
+    assert vodafone['amount'] == 33.0
+    assert vodafone['type'] == 'debit'
+    salary_like = next(t for t in transactions if t['type'] == 'credit')
+    assert salary_like['amount'] == 15000.0
+
+
 def test_extract_raw_text_returns_readable_text_for_ai_fallback():
     pdf_bytes = _build_statement_pdf([
         ['01-Jun-2026', 'UPI/DR/CHALO/Pay', '75.00', '', '231714.00'],
     ])
     text = extract_raw_text(pdf_bytes)
     assert 'CHALO' in text
+
+
+def test_extract_raw_text_preserves_table_column_structure():
+    # The AI fallback needs column alignment, not jumbled linear text, to
+    # reliably map an unfamiliar bank's header to date/description/amount -
+    # extract_raw_text() should render each row with its cells still
+    # separated, not run together the way plain page.extract_text() would.
+    header = ['Date', 'Narration', 'Withdrawal Amt.', 'Deposit Amt.']
+    rows = [['05/05/26', 'ACH D- HDFC BANK LTD', '11611.00', '']]
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter)
+    doc.build([Table([header] + rows, style=_GRID_STYLE)])
+
+    text = extract_raw_text(buffer.getvalue())
+
+    assert 'Withdrawal Amt.' in text
+    assert 'ACH D- HDFC BANK LTD' in text
+    assert '11611.00' in text
+    assert ' | ' in text  # cells are still visibly column-separated, not run together

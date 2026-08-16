@@ -128,6 +128,29 @@ def test_credit_only_row_resolves_from_credit_column():
     assert transactions[0]['raw_amount'] == -50000.0
 
 
+def test_withdrawal_deposit_headers_resolve_like_debit_credit():
+    """
+    Some banks (e.g. HDFC) label the split-amount columns "Withdrawal
+    Amt."/"Deposit Amt." instead of "Debit"/"Credit". Only "Withdrawal"
+    matches HEADER_PATTERNS['debit'], not HEADER_PATTERNS['amount'] (which
+    only recognizes the literal word "debit"), so this column lands as a
+    'debit'-named column rather than 'amount' - _resolve_amount_and_type()
+    must check that column too, not just 'amount' and 'credit'.
+    """
+    csv_bytes = (
+        b'Date,Narration,Withdrawal Amt.,Deposit Amt.\n'
+        b'2024-01-15,ATM Cash Withdrawal,5000,\n'
+        b'2024-01-16,Salary Credit,,60000\n'
+    )
+    transactions = CSVParser(csv_bytes).parse()
+
+    assert len(transactions) == 2
+    assert transactions[0]['amount'] == 5000.0
+    assert transactions[0]['type'] == 'debit'
+    assert transactions[1]['amount'] == 60000.0
+    assert transactions[1]['type'] == 'credit'
+
+
 def test_row_with_both_debit_and_credit_blank_is_rejected():
     csv_bytes = (
         b'Date,Description,Debit,Credit\n'
