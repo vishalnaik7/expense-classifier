@@ -1,16 +1,26 @@
 """
 LLM-based fallback extraction for bank statement files the deterministic
-CSVParser cannot make sense of (unusual layouts, embedded metadata rows
-CSVParser's header-detection window didn't catch, non-standard column
-naming). Used only as a fallback after CSVParser.parse() raises.
+CSVParser/pdf_parser cannot make sense of (unusual layouts, non-standard
+column naming, or - for PDFs - no extractable text layer at all). Used
+only as a fallback after the deterministic parser raises.
 
-Privacy note: this path sends the raw (truncated) file text to whichever
-open-source model services/ai_client.py is pointed at (Ollama locally,
-Groq in production - see that module's docstring), never to a paid
-Anthropic/OpenAI API. It is opt-in via ai_client.is_configured() - if the
-active provider isn't ready, is_configured() returns False and callers
-should skip straight to the deterministic error.
+Two extraction modes, sharing the same schema/prompt/normalization:
+- extract_transactions() - text-based, for CSVs and PDFs that have a text
+  layer but an unrecognized structure.
+- extract_transactions_from_images() - vision-based, for PDFs with zero
+  extractable text (e.g. some HDFC statements draw "text" as vector glyph
+  outlines with no underlying character data - see pdf_parser.py's
+  has_extractable_text()), where there is no text to extract at all and a
+  vision-capable model must read the rendered page images directly.
+
+Privacy note: this sends the raw (truncated) file text or page images to
+whichever open-source model services/ai_client.py is pointed at (Ollama
+locally, Groq in production - see that module's docstring), never to a
+paid Anthropic/OpenAI API. It is opt-in via ai_client.is_configured() -
+if the active provider isn't ready, is_configured() returns False and
+callers should skip straight to the deterministic error.
 """
+import base64
 import hashlib
 import json
 from datetime import datetime
@@ -28,19 +38,24 @@ from services import ai_client
 # than being trusted blindly.
 MAX_INPUT_CHARS = 60000
 
-EXTRACTION_SYSTEM_PROMPT = """You are an expert AI data extraction engine specializing in messy financial documents and CSV bank statements.
+EXTRACTION_SYSTEM_PROMPT = """You are an expert AI data extraction engine specializing in messy financial documents and bank statements.
 
 ### Problem Context:
-The uploaded file's raw text may contain metadata, empty rows, or non-standard headers at the top (e.g. "STATEMENT OF ACCOUNT", account summaries, bank details, "Unnamed" columns).
+The uploaded statement's content may contain metadata, empty rows, or non-standard headers at the top (e.g. "STATEMENT OF ACCOUNT", account summaries, bank details, "Unnamed" columns). Column names vary by bank - a debit/withdrawal column might be labeled "Debit", "Withdrawal", "Withdrawal Amt.", "Paid Out", or similar; a credit/deposit column might be labeled "Credit", "Deposit", "Deposit Amt.", "Paid In", or similar.
 
 ### Instructions:
 1. Ignore any top-level bank metadata, account summaries, or irrelevant header rows.
 2. Locate the actual transaction table containing financial records.
-3. Identify and extract every individual transaction. Even if column names are missing or messy, map the data intelligently to the required fields.
+3. Identify and extract every individual transaction. Even if column names are missing, messy, or unfamiliar, map the data intelligently to the required fields based on their meaning, not exact wording.
 4. Normalize every date to YYYY-MM-DD format.
 5. Classify each transaction strictly as "CREDIT" (money in) or "DEBIT" (money out).
 6. If a running balance column exists, extract it; otherwise use null.
-7. If you cannot confidently find a transaction table in the text, return an empty transactions array - do not invent data."""
+7. If you cannot confidently find a transaction table, return an empty transactions array - do not invent data."""
+
+_VISION_INSTRUCTIONS = """
+
+### Additional Instructions for Reading Images:
+You are given one or more images of bank statement pages (in reading order - read them in the order given, top to bottom, left to right within each page). Read the table exactly as printed, including numbers with commas/decimals. If a row's narration wraps across multiple lines within the same table row, treat it as one transaction, not several."""
 
 
 class LLMExtractionError(Exception):
@@ -77,49 +92,24 @@ _TRANSACTION_SCHEMA = {
 }
 
 
-def extract_transactions(file_content: bytes) -> List[Dict]:
-    """
-    Ask the configured open-source model to extract transactions from a
-    bank statement CSV that the deterministic parser couldn't handle.
-
-    Returns:
-        List of transaction dicts in the same shape CSVParser produces
-        (date, description, amount, type, hash, raw_amount).
-
-    Raises:
-        LLMExtractionError: if the fallback isn't configured, the request
-        fails, the model declines, or no usable transactions come back.
-    """
-    if not is_configured():
-        raise LLMExtractionError(
-            'AI-assisted parsing is not configured. '
-            + ('Set GROQ_API_KEY.' if ai_client.AI_PROVIDER == 'groq' else 'Check AI_PROVIDER.')
-        )
-
-    try:
-        text = file_content.decode('utf-8', errors='replace')
-    except Exception as e:
-        raise LLMExtractionError(f'Could not read file as text: {e}')
-
-    if len(text) > MAX_INPUT_CHARS:
-        text = text[:MAX_INPUT_CHARS]
-
-    system = (
-        f'{EXTRACTION_SYSTEM_PROMPT}\n\n'
+def _build_system_prompt(vision: bool = False) -> str:
+    base = EXTRACTION_SYSTEM_PROMPT + (_VISION_INSTRUCTIONS if vision else '')
+    return (
+        f'{base}\n\n'
         'Respond with ONLY a single JSON object matching exactly this JSON Schema '
         f'(no markdown fences, no extra text):\n{json.dumps(_TRANSACTION_SCHEMA, indent=2)}'
     )
 
+
+def _request_and_normalize(model: str, messages: List[Dict], max_tokens: int = 16000) -> List[Dict]:
+    """Shared request/response handling for both the text and vision extraction requests below."""
     try:
         client = ai_client.get_client()
         response = client.chat.completions.create(
-            model=ai_client.get_model(),
-            max_tokens=16000,
+            model=model,
+            max_tokens=max_tokens,
             response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": f"Extract every transaction from this bank statement file:\n\n{text}"},
-            ],
+            messages=messages,
         )
     except ai_client.AIProviderError as e:
         raise LLMExtractionError(str(e))
@@ -153,6 +143,85 @@ def extract_transactions(file_content: bytes) -> List[Dict]:
         raise LLMExtractionError('AI-extracted rows were not in a usable format')
 
     return transactions
+
+
+def extract_transactions(file_content: bytes) -> List[Dict]:
+    """
+    Ask the configured open-source model to extract transactions from a
+    bank statement file (CSV, or a PDF's extracted text) that the
+    deterministic parser couldn't handle.
+
+    Returns:
+        List of transaction dicts in the same shape CSVParser produces
+        (date, description, amount, type, hash, raw_amount).
+
+    Raises:
+        LLMExtractionError: if the fallback isn't configured, the request
+        fails, the model declines, or no usable transactions come back.
+    """
+    if not is_configured():
+        raise LLMExtractionError(
+            'AI-assisted parsing is not configured. '
+            + ('Set GROQ_API_KEY.' if ai_client.AI_PROVIDER == 'groq' else 'Check AI_PROVIDER.')
+        )
+
+    try:
+        text = file_content.decode('utf-8', errors='replace')
+    except Exception as e:
+        raise LLMExtractionError(f'Could not read file as text: {e}')
+
+    if len(text) > MAX_INPUT_CHARS:
+        text = text[:MAX_INPUT_CHARS]
+
+    messages = [
+        {"role": "system", "content": _build_system_prompt()},
+        {"role": "user", "content": f"Extract every transaction from this bank statement file:\n\n{text}"},
+    ]
+    return _request_and_normalize(ai_client.get_model(), messages)
+
+
+def extract_transactions_from_images(image_pages: List[bytes]) -> List[Dict]:
+    """
+    Ask a vision-capable open-source model to extract transactions
+    directly from rendered bank statement page images. This is the last
+    resort for a PDF with no extractable text layer at all (see
+    pdf_parser.py's has_extractable_text() / render_pages_as_images()),
+    where extract_transactions() has no text to work with in the first
+    place - vision models generally require a different, larger model
+    than the fast text model used elsewhere (services/ai_client.py's
+    get_vision_model()), and this is opt-in on top of AI extraction
+    already being opt-in: it only runs when both the deterministic parser
+    and the text-based AI fallback have nothing to work with.
+
+    Returns:
+        List of transaction dicts in the same shape CSVParser produces.
+
+    Raises:
+        LLMExtractionError: if the fallback isn't configured, no images
+        were provided, the request fails, the model declines, or no
+        usable transactions come back.
+    """
+    if not is_configured():
+        raise LLMExtractionError(
+            'AI-assisted parsing is not configured. '
+            + ('Set GROQ_API_KEY.' if ai_client.AI_PROVIDER == 'groq' else 'Check AI_PROVIDER.')
+        )
+    if not image_pages:
+        raise LLMExtractionError('No page images were provided for vision-based extraction')
+
+    content = [{
+        "type": "text",
+        "text": "Extract every transaction visible in these bank statement page images, in the order given:",
+    }]
+    for image_bytes in image_pages:
+        encoded = base64.b64encode(image_bytes).decode('ascii')
+        content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}"}})
+
+    messages = [
+        {"role": "system", "content": _build_system_prompt(vision=True)},
+        {"role": "user", "content": content},
+    ]
+    return _request_and_normalize(ai_client.get_vision_model(), messages)
 
 
 def _normalize(row: Dict) -> Optional[Dict]:

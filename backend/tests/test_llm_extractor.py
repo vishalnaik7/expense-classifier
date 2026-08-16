@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from services import ai_client
-from services.llm_extractor import LLMExtractionError, extract_transactions, is_configured
+from services.llm_extractor import LLMExtractionError, extract_transactions, extract_transactions_from_images, is_configured
 
 
 def test_not_configured_delegates_to_ai_client(monkeypatch):
@@ -127,3 +127,57 @@ def test_extract_wraps_provider_config_errors(monkeypatch):
     with patch.object(ai_client, 'get_client', side_effect=ai_client.AIProviderError('no GROQ_API_KEY set')):
         with pytest.raises(LLMExtractionError, match='GROQ_API_KEY'):
             extract_transactions(b'some csv text')
+
+
+class TestExtractFromImages:
+    def test_raises_when_not_configured(self, monkeypatch):
+        monkeypatch.setattr(ai_client, 'is_configured', lambda: False)
+        with pytest.raises(LLMExtractionError, match='not configured'):
+            extract_transactions_from_images([b'fake-png-bytes'])
+
+    def test_raises_when_no_images_given(self, monkeypatch):
+        monkeypatch.setattr(ai_client, 'is_configured', lambda: True)
+        with pytest.raises(LLMExtractionError, match='No page images'):
+            extract_transactions_from_images([])
+
+    def test_uses_vision_model_and_sends_images_as_data_uris(self, monkeypatch):
+        monkeypatch.setattr(ai_client, 'is_configured', lambda: True)
+        mock_response = _make_response([
+            {'date': '2026-05-05', 'description': 'ACH D- HDFC BANK LTD', 'amount': 11611.0, 'type': 'DEBIT', 'balance': 9525.05},
+        ])
+
+        with patch.object(ai_client, 'get_client') as mock_get_client, \
+                patch.object(ai_client, 'get_vision_model', return_value='llama3.2-vision'):
+            mock_create = mock_get_client.return_value.chat.completions.create
+            mock_create.return_value = mock_response
+            transactions = extract_transactions_from_images([b'\x89PNG-page-one', b'\x89PNG-page-two'])
+
+        assert len(transactions) == 1
+        assert transactions[0]['amount'] == 11611.0
+        assert transactions[0]['type'] == 'debit'
+
+        call_kwargs = mock_create.call_args.kwargs
+        assert call_kwargs['model'] == 'llama3.2-vision'
+        user_content = call_kwargs['messages'][1]['content']
+        assert user_content[0]['type'] == 'text'
+        image_blocks = [block for block in user_content if block['type'] == 'image_url']
+        assert len(image_blocks) == 2  # one per page image supplied
+        for block in image_blocks:
+            assert block['image_url']['url'].startswith('data:image/png;base64,')
+
+    def test_raises_when_no_transactions_found(self, monkeypatch):
+        monkeypatch.setattr(ai_client, 'is_configured', lambda: True)
+        mock_response = _make_response([])
+
+        with patch.object(ai_client, 'get_client') as mock_get_client:
+            mock_get_client.return_value.chat.completions.create.return_value = mock_response
+            with pytest.raises(LLMExtractionError, match='could not find'):
+                extract_transactions_from_images([b'fake-png-bytes'])
+
+    def test_wraps_connection_errors(self, monkeypatch):
+        monkeypatch.setattr(ai_client, 'is_configured', lambda: True)
+
+        with patch.object(ai_client, 'get_client') as mock_get_client:
+            mock_get_client.return_value.chat.completions.create.side_effect = RuntimeError('network down')
+            with pytest.raises(LLMExtractionError, match='request failed'):
+                extract_transactions_from_images([b'fake-png-bytes'])

@@ -519,6 +519,38 @@ def _get_or_create_category(name):
     return category
 
 
+def _ai_fallback_parse(extension, file_content):
+    """
+    Attempts AI-assisted parsing after the deterministic parser fails.
+
+    For a PDF with no extractable text layer at all (some HDFC statements
+    draw "text" as vector glyph outlines with zero underlying character
+    data - see pdf_parser.has_extractable_text()), a text-based attempt
+    has nothing to read, so this skips straight to vision-based
+    extraction: render the pages as images and let a vision-capable model
+    read them directly. Otherwise it tries text-based extraction first
+    and, for PDFs specifically, also tries vision as a last resort if
+    that fails - a garbled or unhelpful text layer doesn't always mean
+    the rendered page itself is unreadable.
+
+    Raises:
+        LLMExtractionError / PDFParsingError: whichever error occurred on
+        the last attempt, for the caller to report.
+    """
+    if extension == 'pdf' and not pdf_parser.has_extractable_text(file_content):
+        images = pdf_parser.render_pages_as_images(file_content)
+        return llm_extractor.extract_transactions_from_images(images)
+
+    try:
+        ai_input = pdf_parser.extract_raw_text(file_content).encode('utf-8') if extension == 'pdf' else file_content
+        return llm_extractor.extract_transactions(ai_input)
+    except (LLMExtractionError, PDFParsingError):
+        if extension != 'pdf':
+            raise
+        images = pdf_parser.render_pages_as_images(file_content)
+        return llm_extractor.extract_transactions_from_images(images)
+
+
 @app.route('/api/uploads', methods=['POST'])
 @jwt_required()
 def upload_csv():
@@ -580,8 +612,7 @@ def upload_csv():
             }), 422
 
         try:
-            ai_input = pdf_parser.extract_raw_text(file_content).encode('utf-8') if extension == 'pdf' else file_content
-            parsed_transactions = llm_extractor.extract_transactions(ai_input)
+            parsed_transactions = _ai_fallback_parse(extension, file_content)
             used_ai_fallback = True
         except (LLMExtractionError, PDFParsingError) as llm_error:
             upload_record.status = 'failed'

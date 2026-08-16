@@ -17,13 +17,26 @@ gets exactly the same date-format support, duplicate hashing, and
 CSV-injection sanitization as a CSV upload, with only one place that
 logic needs to be correct.
 
-extract_raw_text() is the fallback path: when the deterministic table
-extraction above couldn't confidently find/recognize a transaction table
-(an unfamiliar bank's column naming, or a genuinely flattened/scanned
-layout with no table grid at all), the caller should fall back to the
-existing LLM extractor (services/llm_extractor.py) with this raw text
-instead, exactly as it already does for CSVs the deterministic parser
-can't make sense of.
+extract_raw_text() is the first fallback path: when the deterministic
+table extraction above couldn't confidently find/recognize a transaction
+table (an unfamiliar bank's column naming), the caller should fall back
+to the existing LLM extractor (services/llm_extractor.py) with this raw
+text, exactly as it already does for CSVs the deterministic parser can't
+make sense of.
+
+render_pages_as_images() is the second fallback path, for a case plain
+text extraction cannot help with at all: some bank statement PDFs (seen
+in practice from HDFC) have vector-drawn table grid lines but ZERO
+extractable text characters - the "text" is rendered as glyph outlines
+rather than actual character data, so `page.chars` is empty and
+`extract_text()`/`extract_tables()` cell values come back blank even
+though the statement is perfectly readable when the page is rendered
+visually. This is functionally identical to a scanned image for
+data-extraction purposes (even though there's no single large embedded
+raster image to point at - it's the whole vector page that has no text
+layer), so it needs vision-based extraction: render each page to a PNG
+and let a vision-capable model (services/llm_extractor.py's
+extract_transactions_from_images()) read it directly.
 """
 import csv
 import io
@@ -150,6 +163,60 @@ def extract_raw_text(file_content: bytes) -> str:
             return '\n\n'.join(page_blocks)
     except Exception as e:
         raise PDFParsingError(f'Could not read PDF file: {e}')
+
+
+def has_extractable_text(file_content: bytes) -> bool:
+    """
+    Whether this PDF has any real character-level text data at all, on
+    any page. Some bank-generated statement PDFs draw their "text" as
+    vector glyph outlines with no underlying character data (see the
+    module docstring) - for those, `page.chars` is empty and every text-
+    or table-based extraction path (extract_transaction_csv,
+    extract_raw_text) is fundamentally unable to help, no matter how the
+    header-matching heuristics are tuned, so the caller should skip
+    straight to render_pages_as_images() + vision-based extraction
+    instead of wasting a text-based AI fallback call on empty input.
+    """
+    try:
+        with pdfplumber.open(io.BytesIO(file_content)) as pdf:
+            return any(len(page.chars) > 0 for page in pdf.pages)
+    except Exception:
+        return False
+
+
+# Vision requests grow expensive fast with many high-resolution images -
+# cap both how many pages get rendered and the resolution, enough to keep
+# a statement's numbers legible without ballooning request size/latency.
+MAX_VISION_PAGES = 6
+VISION_IMAGE_RESOLUTION = 150
+
+
+def render_pages_as_images(file_content: bytes, max_pages: int = MAX_VISION_PAGES) -> List[bytes]:
+    """
+    Rasterizes up to `max_pages` pages of the PDF to PNG image bytes, for
+    vision-based extraction (services/llm_extractor.py's
+    extract_transactions_from_images()). This renders the page's full
+    visual content - including vector-drawn "text" that has no
+    extractable character data - so it works even where every text-layer
+    extraction path in this module cannot.
+
+    Raises:
+        PDFParsingError: if the file can't be opened/rendered as a PDF.
+    """
+    if not file_content:
+        raise PDFParsingError('File content is empty')
+    try:
+        with pdfplumber.open(io.BytesIO(file_content)) as pdf:
+            images = []
+            for page in pdf.pages[:max_pages]:
+                png_buffer = io.BytesIO()
+                page.to_image(resolution=VISION_IMAGE_RESOLUTION).original.save(png_buffer, format='PNG')
+                images.append(png_buffer.getvalue())
+            return images
+    except PDFParsingError:
+        raise
+    except Exception as e:
+        raise PDFParsingError(f'Could not render PDF pages as images: {e}')
 
 
 def parse(file_content: bytes) -> List[dict]:

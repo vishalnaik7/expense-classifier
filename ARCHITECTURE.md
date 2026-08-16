@@ -192,28 +192,51 @@ is enforced at the ORM query level, not just the UI.
    fails, the endpoint returns the original deterministic parsing error
    unchanged. See the Security Considerations section below for the
    privacy trade-off this introduces.
-5. `DuplicateDetector` removes duplicates within the file itself; a second
+5. **If the PDF has no extractable text at all** — `pdf_parser.has_extractable_text()`
+   checks `page.chars` across every page — a text-based AI attempt has
+   nothing to read, so the upload skips straight to a third tier: vision-
+   based extraction. Some banks' PDF generators (observed with HDFC) draw
+   the statement's "text" as vector glyph outlines with zero underlying
+   character data, which is functionally identical to a scanned image for
+   data-extraction purposes even though there's no single large embedded
+   raster image to point at. `pdf_parser.render_pages_as_images()`
+   rasterizes each page (via `pdfplumber`'s `pypdfium2`-backed renderer,
+   capped at 6 pages) to a PNG, and `llm_extractor.extract_transactions_from_images()`
+   sends those images to a **vision-capable** model — a separate model
+   from the text model, configured via `AI_VISION_MODEL`/
+   `ai_client.get_vision_model()`, since most fast text models aren't
+   multimodal. For a PDF that does have some text but where the
+   text-based attempt still fails, vision is tried once more as a final
+   fallback before giving up.
+6. `DuplicateDetector` removes duplicates within the file itself; a second
    check against `transactions.tx_hash` for that user removes duplicates
    against previously-imported data. A `(user_id, tx_hash)` unique
    constraint is the last line of defense against a race between two
    concurrent uploads.
-6. `TransactionCategorizer` assigns a category + confidence to each
+7. `TransactionCategorizer` assigns a category + confidence to each
    surviving row.
-7. Rows are bulk-inserted inside a single DB transaction; the `uploads` row
+8. Rows are bulk-inserted inside a single DB transaction; the `uploads` row
    is updated with `parsed_count`/`duplicate_count` and committed together,
    so a partial failure never leaves an `uploads` row claiming success with
    no matching transactions.
 
 **Testing caveat**: PDF parsing is verified against synthetic bank-statement-
 shaped PDFs generated with `reportlab` in `tests/test_pdf_parser.py` and
-`tests/test_pdf_upload.py` (including a layout that mirrors the real IDFC
-FIRST 7-column, multi-page, wrapped-narration-cell format), not against a
-real customer statement file, since no such file is committed to the repo.
-Table extraction quality on `pdfplumber`'s default line-detection strategy
-depends on the PDF being genuine selectable text with a real vector grid
-(true of bank-generated statement PDFs like IDFC FIRST's); a scanned/flattened
-image-only PDF will yield no extractable table and falls through to the AI
-fallback above (or the deterministic error, if AI isn't configured).
+`tests/test_pdf_upload.py`, not against real customer statement files
+(since none are committed to the repo) - but each fixture is built to
+reproduce a specific real-world layout observed while building this
+feature: a 7-column, multi-page, wrapped-narration-cell format matching
+IDFC FIRST; a "Withdrawal Amt."/"Deposit Amt." header matching HDFC; and
+an image-only PDF (a raster image embedded with zero real text objects)
+that reproduces the same `page.chars == 0` condition seen on an actual
+HDFC statement, to exercise the vision fallback without needing a real,
+non-redistributable bank file. Table extraction quality on `pdfplumber`'s
+default line-detection strategy depends on the PDF being genuine
+selectable text with a real vector grid; a PDF with no extractable text
+at all - whether a true scanned image or, as seen with HDFC, vector-drawn
+glyph outlines with no character data - falls through to the vision-based
+AI fallback described above (or the deterministic error, if AI isn't
+configured).
 
 ## 5. AI Provider Architecture (open-source models only)
 

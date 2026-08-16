@@ -35,8 +35,24 @@ from openai import OpenAI
 AI_PROVIDER = os.getenv('AI_PROVIDER', 'ollama').strip().lower()
 
 _PROVIDER_DEFAULTS = {
-    'ollama': {'base_url': 'http://localhost:11434/v1', 'model': 'llama3.1'},
-    'groq': {'base_url': 'https://api.groq.com/openai/v1', 'model': 'llama-3.3-70b-versatile'},
+    'ollama': {
+        'base_url': 'http://localhost:11434/v1',
+        'model': 'llama3.1',
+        # Ollama's vision-capable models are separate pulls from the text
+        # model above - e.g. `ollama pull llama3.2-vision`. Verify against
+        # https://ollama.com/library before relying on this default, since
+        # the exact tag naming can change.
+        'vision_model': 'llama3.2-vision',
+    },
+    'groq': {
+        'base_url': 'https://api.groq.com/openai/v1',
+        'model': 'llama-3.3-70b-versatile',
+        # Groq's vision-capable model lineup changes fairly often (these
+        # are frequently offered as "preview" models) - verify the current
+        # name at https://console.groq.com/docs/models and override via
+        # AI_VISION_MODEL if this default has been retired.
+        'vision_model': 'llama-3.2-11b-vision-preview',
+    },
 }
 
 
@@ -64,9 +80,21 @@ def is_configured() -> bool:
 
 
 def get_model() -> str:
-    """The model name to pass to chat.completions.create, overridable via AI_MODEL."""
+    """The text model name to pass to chat.completions.create, overridable via AI_MODEL."""
     default = _PROVIDER_DEFAULTS.get(AI_PROVIDER, {}).get('model', 'llama3.1')
     return os.getenv('AI_MODEL', default)
+
+
+def get_vision_model() -> str:
+    """
+    The vision-capable model name for image-based extraction (e.g. a bank
+    statement PDF with no extractable text layer - see
+    services/pdf_parser.py's render_pages_as_images()). Separate from
+    get_model(): most fast/cheap text models are not multimodal, so this
+    is deliberately a different model, overridable via AI_VISION_MODEL.
+    """
+    default = _PROVIDER_DEFAULTS.get(AI_PROVIDER, {}).get('vision_model', 'llama3.2-vision')
+    return os.getenv('AI_VISION_MODEL', default)
 
 
 def get_client() -> OpenAI:

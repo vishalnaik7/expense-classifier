@@ -8,6 +8,8 @@ from unittest.mock import patch
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
+from reportlab.lib.utils import ImageReader
+from reportlab.pdfgen import canvas
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle
 
 import main as main_module
@@ -41,6 +43,33 @@ def _upload(client, headers, content=SAMPLE_PDF, filename='statement.pdf'):
         headers=headers,
         content_type='multipart/form-data'
     )
+
+
+def _build_image_only_pdf(lines):
+    """
+    A PDF with zero extractable text (whole page is one embedded raster
+    image) - stands in for the real-world case where a bank's PDF
+    generator draws "text" as vector glyph outlines with no character
+    data (e.g. some HDFC statements). Both cases hit page.chars == 0,
+    which is what routes the upload to vision-based extraction.
+    """
+    from PIL import Image, ImageDraw
+
+    img = Image.new('RGB', (600, 200), 'white')
+    draw = ImageDraw.Draw(img)
+    y = 10
+    for line in lines:
+        draw.text((10, y), line, fill='black')
+        y += 20
+    img_buffer = io.BytesIO()
+    img.save(img_buffer, format='PNG')
+    img_buffer.seek(0)
+
+    pdf_buffer = io.BytesIO()
+    c = canvas.Canvas(pdf_buffer, pagesize=letter)
+    c.drawImage(ImageReader(img_buffer), 50, 500, width=500, height=150)
+    c.save()
+    return pdf_buffer.getvalue()
 
 
 def test_pdf_upload_parses_and_stores_transactions(client, auth_headers):
@@ -112,3 +141,62 @@ def test_pdf_ai_fallback_used_when_deterministic_parser_fails(client, auth_heade
     assert response.status_code == 201
     body = response.get_json()
     assert body['data']['used_ai_fallback'] is True
+
+
+def test_pdf_with_no_extractable_text_goes_straight_to_vision_fallback(client, auth_headers, monkeypatch):
+    # A PDF with zero character-level text (e.g. some HDFC statements) has
+    # nothing for a text-based AI fallback to read - the endpoint should
+    # skip straight to vision-based extraction rather than making a
+    # doomed text-based attempt first.
+    monkeypatch.setattr(main_module.llm_extractor, 'is_configured', lambda: True)
+    image_only_pdf = _build_image_only_pdf(['Date Narration Withdrawal Deposit', '05/05/26 ACH D 11611.00'])
+
+    fake_transactions = [{
+        'date': '2026-05-05',
+        'description': 'ACH D- HDFC BANK LTD',
+        'amount': 11611.0,
+        'type': 'debit',
+        'hash': 'fakevisionhash123',
+        'raw_amount': 11611.0,
+    }]
+
+    with patch.object(main_module.llm_extractor, 'extract_transactions_from_images', return_value=fake_transactions) as mock_vision, \
+            patch.object(main_module.llm_extractor, 'extract_transactions') as mock_text:
+        response = _upload(client, auth_headers, content=image_only_pdf, filename='hdfc_no_text.pdf')
+
+    assert response.status_code == 201
+    body = response.get_json()
+    assert body['data']['used_ai_fallback'] is True
+    mock_vision.assert_called_once()
+    mock_text.assert_not_called()  # text-based fallback would have nothing to read, so it must be skipped
+
+    transactions = client.get('/api/transactions', headers=auth_headers).get_json()['data']
+    assert any('HDFC BANK' in t['description'] for t in transactions)
+
+
+def test_pdf_vision_fallback_used_when_text_fallback_also_fails(client, auth_headers, monkeypatch):
+    # A PDF that DOES have some text, but where the text-based AI attempt
+    # still can't find a transaction table, should still get a vision
+    # attempt as a last resort before giving up entirely.
+    monkeypatch.setattr(main_module.llm_extractor, 'is_configured', lambda: True)
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter)
+    doc.build([Table([['Foo', 'Bar'], ['1', '2']], style=_GRID_STYLE)])
+
+    fake_transactions = [{
+        'date': '2026-06-01',
+        'description': 'Recovered via vision',
+        'amount': 100.0,
+        'type': 'debit',
+        'hash': 'fakevisionhash456',
+        'raw_amount': 100.0,
+    }]
+
+    with patch.object(main_module.llm_extractor, 'extract_transactions', side_effect=main_module.LLMExtractionError('AI could not find a transaction table in this file')), \
+            patch.object(main_module.llm_extractor, 'extract_transactions_from_images', return_value=fake_transactions) as mock_vision:
+        response = _upload(client, auth_headers, content=buffer.getvalue(), filename='unreadable.pdf')
+
+    assert response.status_code == 201
+    body = response.get_json()
+    assert body['data']['used_ai_fallback'] is True
+    mock_vision.assert_called_once()

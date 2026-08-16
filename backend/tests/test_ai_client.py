@@ -36,6 +36,18 @@ class TestOllamaProvider:
         assert str(client.base_url).rstrip('/') == 'http://localhost:9999/v1'
         assert mod.get_model() == 'mistral'
 
+    def test_default_vision_model(self, monkeypatch):
+        monkeypatch.setenv('AI_PROVIDER', 'ollama')
+        monkeypatch.delenv('AI_VISION_MODEL', raising=False)
+        mod = _reload()
+        assert mod.get_vision_model() == 'llama3.2-vision'
+
+    def test_vision_model_override(self, monkeypatch):
+        monkeypatch.setenv('AI_PROVIDER', 'ollama')
+        monkeypatch.setenv('AI_VISION_MODEL', 'llava')
+        mod = _reload()
+        assert mod.get_vision_model() == 'llava'
+
 
 class TestGroqProvider:
     def test_not_configured_without_key(self, monkeypatch):
@@ -68,6 +80,13 @@ class TestGroqProvider:
         mod = _reload()
         with pytest.raises(mod.AIProviderError, match='GROQ_API_KEY'):
             mod.get_client()
+
+    def test_default_vision_model(self, monkeypatch):
+        monkeypatch.setenv('AI_PROVIDER', 'groq')
+        monkeypatch.setenv('GROQ_API_KEY', 'gsk-test-key')
+        monkeypatch.delenv('AI_VISION_MODEL', raising=False)
+        mod = _reload()
+        assert mod.get_vision_model() == 'llama-3.2-11b-vision-preview'
 
 
 class TestUnknownProvider:

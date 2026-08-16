@@ -12,9 +12,18 @@ import io
 import pytest
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
+from reportlab.lib.utils import ImageReader
+from reportlab.pdfgen import canvas
 from reportlab.platypus import PageBreak, SimpleDocTemplate, Table, TableStyle
 
-from services.pdf_parser import PDFParsingError, extract_raw_text, extract_transaction_csv, parse
+from services.pdf_parser import (
+    PDFParsingError,
+    extract_raw_text,
+    extract_transaction_csv,
+    has_extractable_text,
+    parse,
+    render_pages_as_images,
+)
 
 TXN_HEADER = ['Transaction Date', 'Particulars', 'Debit', 'Credit', 'Balance']
 
@@ -35,6 +44,39 @@ def _build_statement_pdf(page1_rows, page2_rows=None):
 
     doc.build(elements)
     return buffer.getvalue()
+
+
+def _build_image_only_pdf(lines, num_pages=1):
+    """
+    A PDF whose page content is a single embedded raster image with zero
+    real text objects - page.chars comes back empty, the same as the
+    real-world case this module is built to handle (some bank PDF
+    generators draw "text" as vector glyph outlines with no character
+    data at all). The generation technique differs from the real case,
+    but the resulting property under test - zero extractable text - is
+    identical, which is what has_extractable_text()/the vision fallback
+    actually depend on.
+    """
+    from PIL import Image, ImageDraw
+
+    img = Image.new('RGB', (600, 200), 'white')
+    draw = ImageDraw.Draw(img)
+    y = 10
+    for line in lines:
+        draw.text((10, y), line, fill='black')
+        y += 20
+    img_buffer = io.BytesIO()
+    img.save(img_buffer, format='PNG')
+    img_buffer.seek(0)
+    image_reader = ImageReader(img_buffer)
+
+    pdf_buffer = io.BytesIO()
+    c = canvas.Canvas(pdf_buffer, pagesize=letter)
+    for _ in range(num_pages):
+        c.drawImage(image_reader, 50, 500, width=500, height=150)
+        c.showPage()
+    c.save()
+    return pdf_buffer.getvalue()
 
 
 def test_extract_transaction_csv_reconstructs_header_and_rows():
@@ -198,3 +240,57 @@ def test_extract_raw_text_preserves_table_column_structure():
     assert 'ACH D- HDFC BANK LTD' in text
     assert '11611.00' in text
     assert ' | ' in text  # cells are still visibly column-separated, not run together
+
+
+class TestHasExtractableText:
+    def test_true_for_a_normal_text_based_pdf(self):
+        pdf_bytes = _build_statement_pdf([
+            ['01-Jun-2026', 'UPI/DR/CHALO/Pay', '75.00', '', '231714.00'],
+        ])
+        assert has_extractable_text(pdf_bytes) is True
+
+    def test_false_for_an_image_only_pdf(self):
+        # Stands in for the real-world HDFC case: vector-drawn glyph
+        # outlines with zero character-level text data - page.chars is
+        # empty exactly like it is for a page that's just one embedded image.
+        pdf_bytes = _build_image_only_pdf(['Date Narration Withdrawal Deposit', '05/05/26 ACH D 11611.00'])
+        assert has_extractable_text(pdf_bytes) is False
+
+    def test_false_for_garbage_bytes(self):
+        assert has_extractable_text(b'not a real pdf') is False
+
+
+class TestRenderPagesAsImages:
+    def test_returns_one_png_per_page(self):
+        pdf_bytes = _build_statement_pdf(
+            page1_rows=[['01-Jun-2026', 'UPI/DR/CHALO/Pay', '75.00', '', '231714.00']],
+            page2_rows=[['05-Jul-2026', 'IRCTC Ticket Booking', '442.70', '', '250000.00']],
+        )
+        images = render_pages_as_images(pdf_bytes)
+        assert len(images) == 2
+        for png_bytes in images:
+            assert png_bytes[:8] == b'\x89PNG\r\n\x1a\n'  # PNG file signature
+
+    def test_respects_max_pages(self):
+        pdf_bytes = _build_statement_pdf(
+            page1_rows=[['01-Jun-2026', 'UPI/DR/CHALO/Pay', '75.00', '', '231714.00']],
+            page2_rows=[['05-Jul-2026', 'IRCTC Ticket Booking', '442.70', '', '250000.00']],
+        )
+        images = render_pages_as_images(pdf_bytes, max_pages=1)
+        assert len(images) == 1
+
+    def test_works_on_a_page_with_no_extractable_text(self):
+        # This is the whole point: rendering must succeed even where every
+        # text-layer extraction path in this module has nothing to read.
+        pdf_bytes = _build_image_only_pdf(['Date Narration Withdrawal Deposit', '05/05/26 ACH D 11611.00'])
+        images = render_pages_as_images(pdf_bytes)
+        assert len(images) == 1
+        assert images[0][:8] == b'\x89PNG\r\n\x1a\n'
+
+    def test_empty_file_raises(self):
+        with pytest.raises(PDFParsingError, match='empty'):
+            render_pages_as_images(b'')
+
+    def test_garbage_bytes_raise(self):
+        with pytest.raises(PDFParsingError):
+            render_pages_as_images(b'not a real pdf')
