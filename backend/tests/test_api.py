@@ -39,6 +39,20 @@ class TestHealthCheck:
         assert body['data']['database'] == 'ok'
 
 
+class TestDatabaseUrlNormalization:
+    def test_legacy_postgres_scheme_is_rewritten(self):
+        url = main_module._normalize_database_url('postgres://user:pass@host:5432/db')
+        assert url == 'postgresql://user:pass@host:5432/db'
+
+    def test_modern_postgresql_scheme_is_left_alone(self):
+        url = 'postgresql://user:pass@host:5432/db'
+        assert main_module._normalize_database_url(url) == url
+
+    def test_sqlite_url_is_left_alone(self):
+        url = 'sqlite:///expense.db'
+        assert main_module._normalize_database_url(url) == url
+
+
 class TestAuth:
     def test_signup_creates_user_and_returns_tokens(self, client):
         response = client.post('/api/auth/signup', json={

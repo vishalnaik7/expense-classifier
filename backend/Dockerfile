@@ -20,12 +20,17 @@ COPY . .
 RUN useradd -m appuser && chown -R appuser:appuser /app
 USER appuser
 
-# Expose port
+# Railway (and most PaaS) inject a dynamic $PORT at container start, a
+# different value on every deploy - this default of 5000 only applies to
+# a plain `docker run` with no -e PORT=... set (e.g. local testing).
+ENV PORT=5000
 EXPOSE 5000
 
-# Health check
+# Uses Python's built-in urllib (no extra dependency) and reads $PORT at
+# runtime, so this works identically whether run locally or on Railway.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD python -c "import requests; requests.get('http://localhost:5000/api/health')"
+    CMD python -c "import os, urllib.request; urllib.request.urlopen('http://localhost:' + os.environ.get('PORT', '5000') + '/api/health', timeout=5)"
 
-# Run application
-CMD ["gunicorn", "-w", "4", "-b", "0.0.0.0:5000", "main:app"]
+# Shell form (not a JSON array) so $PORT is expanded by the shell at
+# container start, not baked in at build time.
+CMD gunicorn -w 2 -b 0.0.0.0:$PORT main:app

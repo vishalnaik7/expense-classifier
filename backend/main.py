@@ -45,8 +45,21 @@ load_dotenv()
 
 app = Flask(__name__)
 
+
+def _normalize_database_url(url):
+    """
+    Some hosting providers still hand out the legacy "postgres://" scheme
+    (e.g. Heroku-style addons); SQLAlchemy 1.4+ only recognizes the
+    dialect name "postgresql", so normalize it here rather than requiring
+    every deployment target to happen to provide the newer scheme already.
+    """
+    if url.startswith('postgres://'):
+        return url.replace('postgres://', 'postgresql://', 1)
+    return url
+
+
 # Configuration
-app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'sqlite:///expense.db')
+app.config['SQLALCHEMY_DATABASE_URI'] = _normalize_database_url(os.getenv('DATABASE_URL', 'sqlite:///expense.db'))
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'your-super-secret-key-change-in-production')
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(hours=1)

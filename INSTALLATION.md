@@ -603,37 +603,67 @@ is a limited monthly trial credit, not an indefinitely-free tier like
 Render's or Vercel's** - fine for a personal/demo project, but worth
 knowing going in.
 
-### Option A: Railway (backend + database in one place)
+### Option A: Railway, via Docker (both services in one project)
 
-1. **Sign up at [railway.com](https://railway.com)** and connect your
-   GitHub account.
-2. **New Project → Deploy from GitHub repo** → select this repository.
-3. **Set the service's Root Directory to `backend`** (Settings → Root
-   Directory) - this repo is a monorepo (`backend/` + `frontend/`), and
-   Railway needs to know which folder to build. It will then auto-detect
-   the Python app via Nixpacks and use `backend/Procfile` /
-   `backend/railway.json` (already included in this repo) for the start
-   command and health check (`GET /api/health`).
-4. **Add a PostgreSQL database**: New → Database → PostgreSQL within the
-   same Railway project. Railway injects a `DATABASE_URL` variable
-   automatically - reference it in the backend service's variables as
-   `${{Postgres.DATABASE_URL}}` (Railway's variable-reference syntax), or
-   copy the value directly.
-5. **Set the backend service's environment variables** (Variables tab):
-   - `JWT_SECRET_KEY` - generate with `openssl rand -hex 32`
-   - `DATABASE_URL` - from step 4
-   - `CORS_ORIGINS` - your deployed frontend's URL (step 7)
-   - `AI_PROVIDER=groq`, `GROQ_API_KEY` - see "AI provider" below
-6. Railway assigns a public URL under Settings → Networking → **Generate
-   Domain**. That URL is your backend's base URL.
-7. **Frontend** - deploy separately on [Vercel](https://vercel.com) or
-   [Netlify](https://netlify.com) (genuinely free, no trial-credit limit,
-   better fit for a static React build) pointed at this repo's
-   `frontend/` folder, with `REACT_APP_API_URL` set to
-   `<your-railway-backend-url>/api`. Railway can also host the frontend
-   as a second service in the same project (Node buildpack running
-   `npm run build` + `npx serve -s build`) if you'd rather keep
-   everything on one platform, at the cost of extra trial-credit usage.
+Both `backend/` and `frontend/` have a production `Dockerfile` and a
+`railway.json` pinned to `"builder": "DOCKERFILE"` - Railway builds and
+runs the actual Docker image rather than guessing at a buildpack, so
+what runs in production is exactly what `docker build` produces locally.
+This is two Railway **services** inside **one Railway project**, not two
+separate projects.
+
+**1. Create the project and the backend service**
+- Sign up at [railway.com](https://railway.com) and connect your GitHub account.
+- **New Project → Deploy from GitHub repo** → select this repository.
+  Railway creates one service from it; treat that as the backend.
+- Open that service → **Settings → Root Directory** → set it to `backend`.
+  This repo is a monorepo, and the Dockerfile paths in `railway.json` are
+  relative to whatever Root Directory you set here.
+- Railway will detect `backend/railway.json` and build `backend/Dockerfile`
+  automatically on the next deploy.
+
+**2. Add a PostgreSQL database**
+- In the same project: **New → Database → PostgreSQL**.
+- On the backend service's **Variables** tab, add `DATABASE_URL` and set
+  it to `${{Postgres.DATABASE_URL}}` (Railway's cross-service variable
+  reference - it resolves to the Postgres plugin's real connection
+  string, kept in sync automatically).
+
+**3. Set the backend service's remaining Variables**
+- `JWT_SECRET_KEY` - generate with `openssl rand -hex 32`
+- `CORS_ORIGINS` - the frontend service's URL (you'll get this in step 5;
+  it's fine to come back and fill this in after)
+- `AI_PROVIDER=groq`, `GROQ_API_KEY` - see "AI provider" below
+- Under **Settings → Networking**, click **Generate Domain** to get a
+  public URL for the backend. Copy it - the frontend needs it next.
+
+**4. Add the frontend as a second service in the same project**
+- In the same Railway project: **New → GitHub Repo** → select this same
+  repository again. This creates a second, independent service.
+- Open it → **Settings → Root Directory** → set it to `frontend`.
+- **Settings → Build → Build Variables** (not the regular runtime
+  Variables tab - Create React App bakes `REACT_APP_*` values into the
+  static JS bundle at build time, so it must be visible during the build
+  step specifically) → add `REACT_APP_API_URL` set to
+  `<your-backend-domain-from-step-3>/api`.
+- **Settings → Networking → Generate Domain** for this service too. That
+  URL is your live app.
+- Go back to the backend service's Variables and set `CORS_ORIGINS` to
+  this frontend URL, then redeploy the backend so the CORS change takes
+  effect.
+
+**Redeploying after a code change**: push to GitHub - both services are
+already connected to this repo and rebuild automatically. There's no
+separate "docker push" step; Railway builds the Dockerfile itself on
+every deploy.
+
+**If you'd rather keep the frontend off Railway** (its free tier is a
+limited trial credit, not indefinite - see the note above), deploy only
+the backend service above and host the frontend on
+[Vercel](https://vercel.com) or [Netlify](https://netlify.com) instead
+(genuinely free, no trial-credit limit, and a better-optimized fit for a
+static React build) - point it at `frontend/`, and set the same
+`REACT_APP_API_URL` build-time variable there instead of on Railway.
 
 ### Option B: Render + Vercel + Neon (each genuinely free, not trial-limited)
 
