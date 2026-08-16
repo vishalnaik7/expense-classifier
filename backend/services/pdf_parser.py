@@ -58,11 +58,15 @@ def _looks_like_header_row(row: List[Optional[str]]) -> bool:
     (not the small Opening/Total Debit/Total Credit/Closing Balance summary
     block that most bank statement PDFs print above it)?
 
-    Different banks name the amount columns differently - IDFC FIRST uses
-    "Debit"/"Credit", HDFC uses "Withdrawal Amt."/"Deposit Amt." - so this
-    checks a broader set of synonyms rather than just "debit"/"credit"/
-    "amount", to avoid silently failing to even recognize the header on a
-    bank format this hasn't specifically been tested against before.
+    Different banks name the amount and narration columns differently -
+    IDFC FIRST uses "Debit"/"Credit" and "Particulars", HDFC uses
+    "Withdrawal Amt."/"Deposit Amt." and "Narration", SBI uses "Credit"/
+    "Debit" and "Transaction Reference" - so this checks a broader set of
+    synonyms rather than one bank's exact wording, to avoid silently
+    failing to even recognize the header on a format this hasn't
+    specifically been tested against before. "transaction reference" is
+    matched as the exact phrase, not bare "reference", since a separate
+    "Ref.No./Chq.No." column must not be mistaken for the narration.
     """
     cells = [str(c or '').strip().lower() for c in row]
     has_date = any('date' in c for c in cells)
@@ -70,7 +74,10 @@ def _looks_like_header_row(row: List[Optional[str]]) -> bool:
         h in c for c in cells
         for h in ('debit', 'credit', 'amount', 'withdrawal', 'deposit')
     )
-    has_description = any(h in c for c in cells for h in ('particulars', 'narration', 'description'))
+    has_description = any(
+        h in c for c in cells
+        for h in ('particulars', 'narration', 'description', 'transaction reference')
+    )
     return has_date and has_amount and has_description
 
 

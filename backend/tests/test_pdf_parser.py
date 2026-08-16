@@ -214,6 +214,39 @@ def test_hdfc_style_withdrawal_deposit_headers_are_recognized():
     assert salary_like['amount'] == 15000.0
 
 
+def test_sbi_style_transaction_reference_and_credit_before_debit_are_handled():
+    # SBI's real layout: narration column is "Transaction Reference" (not
+    # Particulars/Narration), and "Credit" is printed BEFORE "Debit" -
+    # both are distinct regression cases from the IDFC/HDFC formats above.
+    # Also includes SBI's own "Your Opening Balance on ..." summary row,
+    # embedded as a row within the transaction table itself (rather than a
+    # separate block above it, unlike IDFC/HDFC) - it must not be
+    # misread as a transaction.
+    header = ['Date', 'Transaction Reference', 'Ref.No./Chq.No.', 'Credit', 'Debit', 'Balance']
+    rows = [
+        ['', 'Your Opening Balance on 01-07-26:', '', '', '', '21998.09'],
+        ['02-07-26', 'UPI/CR/618365212987/Usha Vis/SBIN/ushapokhar/UPI', '-', '1333.00', '', '23331.09'],
+        ['12-07-26', 'UPI/DR/619324686243/www.pmpm/INDB/wwwpmpmlor/UPIIn', '-', '', '20.00', '23311.09'],
+        ['24-07-26', 'SBIY226205214726798877723/M/Transfer to Family or', '-', '10000.00', '', '32093.19'],
+    ]
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter)
+    doc.build([Table([header] + rows, style=_GRID_STYLE)])
+
+    transactions = parse(buffer.getvalue())
+
+    assert len(transactions) == 3  # the Opening Balance row has no date and is correctly dropped
+    usha = next(t for t in transactions if 'Usha' in t['description'])
+    assert usha['amount'] == 1333.0
+    assert usha['type'] == 'credit'
+    transfer = next(t for t in transactions if 'Transfer to Family' in t['description'])
+    assert transfer['amount'] == 10000.0
+    assert transfer['type'] == 'credit'
+    debit_txn = next(t for t in transactions if t['type'] == 'debit')
+    assert debit_txn['amount'] == 20.0
+
+
 def test_extract_raw_text_returns_readable_text_for_ai_fallback():
     pdf_bytes = _build_statement_pdf([
         ['01-Jun-2026', 'UPI/DR/CHALO/Pay', '75.00', '', '231714.00'],

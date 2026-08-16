@@ -27,11 +27,29 @@ class CSVParser:
     - Bank-specific formats (HDFC, ICICI, Axis, etc.)
     """
     
-    # Common header patterns for different banks
+    # Common header patterns for different banks. 'transaction reference'
+    # (SBI's narration column) is listed as the exact two-word phrase, not
+    # bare 'reference', since some banks also have a separate "Ref.No./
+    # Chq.No." column that must NOT be mistaken for the narration.
+    #
+    # 'amount' intentionally does NOT include 'debit'/'credit' as
+    # synonyms, even though a lone "Debit"/"Withdrawal"-style column is a
+    # valid amount source (see _resolve_amount_and_type, which checks an
+    # 'amount' OR 'debit' column for the debit side). Column order in the
+    # source file is not guaranteed - some banks print Credit before
+    # Debit (e.g. SBI) - and _normalize_headers() assigns each standard
+    # name to the FIRST unclaimed header that matches, in dict-iteration
+    # order. If 'credit' matched here too, a "Credit" column appearing
+    # before "Debit" would be claimed as 'amount' (the debit-side slot)
+    # before the dedicated 'credit' pass ever got to it, silently
+    # recording every incoming credit as an outgoing debit. Leaving
+    # 'amount' to match only its own literal words, and letting the
+    # 'debit'/'credit' passes claim their own columns independently,
+    # keeps the result correct regardless of column order.
     HEADER_PATTERNS = {
         'date': ['date', 'transaction date', 'txn date', 'posting date'],
-        'description': ['description', 'narration', 'particulars', 'txn description'],
-        'amount': ['amount', 'transacted amount', 'debit', 'credit'],
+        'description': ['description', 'narration', 'particulars', 'txn description', 'transaction reference'],
+        'amount': ['amount', 'transacted amount'],
         'debit': ['debit', 'withdrawal'],
         'credit': ['credit', 'deposit']
     }
@@ -420,6 +438,7 @@ class CSVParser:
             '%d-%m-%Y',      # DD-MM-YYYY
             '%m/%d/%Y',      # MM/DD/YYYY
             '%d/%m/%y',      # DD/MM/YY
+            '%d-%m-%y',      # DD-MM-YY (e.g. SBI's 02-07-26)
             '%m/%d/%y',      # MM/DD/YY
             '%d-%b-%Y',      # 01-Jun-2026 (common Indian bank statement format)
             '%d-%b-%y',      # 01-Jun-26

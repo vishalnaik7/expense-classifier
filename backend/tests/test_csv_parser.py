@@ -151,6 +151,49 @@ def test_withdrawal_deposit_headers_resolve_like_debit_credit():
     assert transactions[1]['type'] == 'credit'
 
 
+def test_sbi_style_credit_before_debit_column_order_is_not_misclassified():
+    """
+    SBI's statement prints "Credit" BEFORE "Debit" (most banks tested so
+    far print Debit first). HEADER_PATTERNS['amount'] used to include the
+    literal words 'debit' and 'credit' as synonyms, so whichever of the
+    two columns appeared first in the file got claimed as 'amount' (the
+    debit-side slot) - for SBI that meant "Credit" got misread as a debit
+    column, and every incoming credit was silently recorded as an
+    outgoing expense. 'amount' no longer matches those words at all; the
+    dedicated 'debit'/'credit' patterns must claim their own columns
+    correctly regardless of which one appears first.
+    """
+    csv_bytes = (
+        b'Date,Transaction Reference,Ref.No./Chq.No.,Credit,Debit,Balance\n'
+        b'02-07-26,UPI/CR/618365212987/Usha Vis/SBIN/ushapokhar/UPI,-,1333.00,,23331.09\n'
+        b'12-07-26,UPI/DR/619324686243/www.pmpm/INDB/wwwpmpmlor/UPIIn,-,,20.00,23311.09\n'
+    )
+    transactions = CSVParser(csv_bytes).parse()
+
+    assert len(transactions) == 2
+    credit_txn = next(t for t in transactions if t['amount'] == 1333.0)
+    assert credit_txn['type'] == 'credit'
+    debit_txn = next(t for t in transactions if t['amount'] == 20.0)
+    assert debit_txn['type'] == 'debit'
+
+
+def test_sbi_transaction_reference_column_resolves_as_description():
+    """SBI labels its narration column "Transaction Reference", not "Particulars"/"Narration"/"Description"."""
+    csv_bytes = (
+        b'Date,Transaction Reference,Ref.No./Chq.No.,Credit,Debit,Balance\n'
+        b'02-07-26,UPI/CR/618365212987/Usha Vis/SBIN/ushapokhar/UPI,-,1333.00,,23331.09\n'
+    )
+    transactions = CSVParser(csv_bytes).parse()
+    assert transactions[0]['description'] == 'UPI/CR/618365212987/Usha Vis/SBIN/ushapokhar/UPI'
+
+
+def test_parses_two_digit_year_with_dash_separators():
+    """SBI's date format is DD-MM-YY (e.g. 02-07-26), distinct from the already-supported DD/MM/YY and DD-MM-YYYY."""
+    csv_bytes = b'Date,Description,Amount\n02-07-26,Test transaction,100\n'
+    transactions = CSVParser(csv_bytes).parse()
+    assert transactions[0]['date'] == '2026-07-02'
+
+
 def test_row_with_both_debit_and_credit_blank_is_rejected():
     csv_bytes = (
         b'Date,Description,Debit,Credit\n'
