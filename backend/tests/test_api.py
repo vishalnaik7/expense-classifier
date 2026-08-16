@@ -39,6 +39,18 @@ class TestHealthCheck:
         assert body['data']['database'] == 'ok'
 
 
+class TestCorsOriginsParsing:
+    def test_strips_trailing_slash_and_whitespace(self):
+        origins = main_module._parse_cors_origins(' https://app.vercel.app/ , https://other.app ')
+        assert origins == ['https://app.vercel.app', 'https://other.app']
+
+    def test_single_origin_no_trailing_slash_unaffected(self):
+        assert main_module._parse_cors_origins('http://localhost:3000') == ['http://localhost:3000']
+
+    def test_empty_entries_are_dropped(self):
+        assert main_module._parse_cors_origins('https://app.vercel.app,,') == ['https://app.vercel.app']
+
+
 class TestDatabaseUrlNormalization:
     def test_legacy_postgres_scheme_is_rewritten(self):
         url = main_module._normalize_database_url('postgres://user:pass@host:5432/db')

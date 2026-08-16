@@ -71,7 +71,18 @@ ALLOWED_UPLOAD_EXTENSIONS = {'csv', 'pdf'}
 # Initialize extensions
 db = SQLAlchemy(app)
 jwt = JWTManager(app)
-CORS(app, origins=os.getenv('CORS_ORIGINS', 'http://localhost:3000').split(','), supports_credentials=True)
+def _parse_cors_origins(raw):
+    """
+    Flask-CORS matches an Origin header exactly - a stray trailing slash
+    or copy-pasted whitespace in CORS_ORIGINS (e.g. "https://app.vercel.app/ "
+    instead of "https://app.vercel.app") silently makes every request from
+    that origin fail preflight with no useful error beyond "CORS blocked",
+    so normalize each entry rather than trusting the env var verbatim.
+    """
+    return [origin.strip().rstrip('/') for origin in raw.split(',') if origin.strip()]
+
+
+CORS(app, origins=_parse_cors_origins(os.getenv('CORS_ORIGINS', 'http://localhost:3000')), supports_credentials=True)
 
 # ============================================================================
 # DATABASE MODELS
