@@ -1767,10 +1767,39 @@ def export_csv():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+def _report_table(data, col_widths, right_align_from=1):
+    """
+    Shared styling for every table in the PDF report: a blue header row,
+    grey grid lines, and right-aligned numeric columns from
+    `right_align_from` onward - keeps every section of the report visually
+    consistent instead of repeating the same TableStyle per section.
+    """
+    table = Table(data, colWidths=col_widths)
+    table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#3B82F6')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 8),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+        ('ALIGN', (right_align_from, 0), (-1, -1), 'RIGHT'),
+    ]))
+    return table
+
+
 @app.route('/api/export/pdf', methods=['GET'])
 @jwt_required()
 def export_pdf():
-    """Export a summary spending report as a downloadable PDF"""
+    """
+    Export a detailed financial report as a downloadable PDF, covering
+    every major feature area of the app - not just a transaction list -
+    so the report is a complete standalone snapshot: summary, spending by
+    category, top merchants, and transaction detail respect the report's
+    period filter (period/date_from/date_to/category, same as CSV
+    export); monthly trend, budgets, and goals always reflect the last 12
+    months / current live state, since those aren't meaningfully
+    filterable by an arbitrary reporting period the same way a
+    transaction list is.
+    """
     try:
         user_id = get_jwt_identity()
         user = User.query.get(user_id)
@@ -1781,54 +1810,146 @@ def export_pdf():
         styles = getSampleStyleSheet()
         elements = []
 
-        elements.append(Paragraph('Expense Report', styles['Title']))
-        elements.append(Paragraph(f"Generated for {user.username if user else 'user'} on "
-                                   f"{datetime.utcnow().strftime('%d %b %Y')}", styles['Normal']))
+        # --- Header ---
+        elements.append(Paragraph('Fintech Expense Report', styles['Title']))
+        elements.append(Paragraph(
+            f"Generated for {user.username if user else 'user'} on {datetime.utcnow().strftime('%d %b %Y')}",
+            styles['Normal']
+        ))
+        period_label = request.args.get('period') or 'All time'
+        elements.append(Paragraph(f'Report period: {period_label}', styles['Normal']))
         elements.append(Spacer(1, 16))
 
+        # --- Summary ---
         total_spent = sum(float(t.amount) for t in transactions if t.transaction_type == 'debit')
-        elements.append(Paragraph(f'Total Spent: Rs. {total_spent:,.2f}', styles['Heading2']))
-        elements.append(Paragraph(f'Total Transactions: {len(transactions)}', styles['Normal']))
-        elements.append(Spacer(1, 16))
-
-        # Category breakdown table
-        category_totals = defaultdict(float)
-        for t in transactions:
-            category_totals[t.category.name if t.category else 'Other'] += float(t.amount)
-
-        elements.append(Paragraph('Spending by Category', styles['Heading2']))
-        cat_data = [['Category', 'Amount']] + [
-            [name, f'Rs. {amount:,.2f}']
-            for name, amount in sorted(category_totals.items(), key=lambda x: x[1], reverse=True)
-        ]
-        cat_table = Table(cat_data, colWidths=[300, 150])
-        cat_table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#3B82F6')),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
-            ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
-        ]))
-        elements.append(cat_table)
+        total_income = sum(float(t.amount) for t in transactions if t.transaction_type == 'credit')
+        elements.append(Paragraph('Summary', styles['Heading2']))
+        summary_table = _report_table([
+            ['Metric', 'Value'],
+            ['Total Income', f'Rs. {total_income:,.2f}'],
+            ['Total Spending', f'Rs. {total_spent:,.2f}'],
+            ['Net Savings', f'Rs. {total_income - total_spent:,.2f}'],
+            ['Total Transactions', str(len(transactions))],
+        ], col_widths=[300, 150])
+        elements.append(summary_table)
         elements.append(Spacer(1, 20))
 
-        # Transaction detail table (most recent 100 to keep the PDF readable)
-        elements.append(Paragraph('Recent Transactions', styles['Heading2']))
-        txn_data = [['Date', 'Description', 'Category', 'Amount']] + [
-            [t.transaction_date.isoformat(), t.description[:40],
-             t.category.name if t.category else 'Other', f'Rs. {float(t.amount):,.2f}']
-            for t in transactions[:100]
-        ]
-        txn_table = Table(txn_data, colWidths=[70, 220, 100, 80])
-        txn_table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#3B82F6')),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, -1), 8),
-            ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
-            ('ALIGN', (3, 0), (3, -1), 'RIGHT'),
-        ]))
-        elements.append(txn_table)
+        # --- Spending by Category ---
+        category_totals = defaultdict(float)
+        merchant_totals = defaultdict(float)
+        for t in transactions:
+            if t.transaction_type == 'debit':
+                category_totals[t.category.name if t.category else 'Other'] += float(t.amount)
+                merchant_totals[_extract_merchant(t.description)] += float(t.amount)
+
+        elements.append(Paragraph('Spending by Category', styles['Heading2']))
+        cat_rows = [['Category', 'Amount']] + (
+            [[name, f'Rs. {amount:,.2f}'] for name, amount in sorted(category_totals.items(), key=lambda x: x[1], reverse=True)]
+            if category_totals else [['No spending data for this period', '']]
+        )
+        elements.append(_report_table(cat_rows, col_widths=[300, 150]))
+        elements.append(Spacer(1, 20))
+
+        # --- Top Merchants ---
+        elements.append(Paragraph('Top Merchants', styles['Heading2']))
+        top_merchants = sorted(merchant_totals.items(), key=lambda x: x[1], reverse=True)[:10]
+        merchant_rows = [['Merchant', 'Amount']] + (
+            [[name, f'Rs. {amount:,.2f}'] for name, amount in top_merchants]
+            if top_merchants else [['No merchant data for this period', '']]
+        )
+        elements.append(_report_table(merchant_rows, col_widths=[300, 150]))
+        elements.append(Spacer(1, 20))
+
+        # --- Monthly Trend (last 12 months, independent of the report's period filter) ---
+        today = datetime.utcnow().date()
+        window_start = today.replace(day=1) - relativedelta(months=11)
+        trend_txns = Transaction.query.filter(
+            Transaction.user_id == user_id,
+            Transaction.transaction_date >= window_start,
+            Transaction.transaction_date <= today,
+        ).all()
+        monthly_income = defaultdict(float)
+        monthly_spend = defaultdict(float)
+        for t in trend_txns:
+            key = (t.transaction_date.year, t.transaction_date.month)
+            if t.transaction_type == 'credit':
+                monthly_income[key] += float(t.amount)
+            else:
+                monthly_spend[key] += float(t.amount)
+        months_seen = sorted(set(monthly_income) | set(monthly_spend))
+
+        elements.append(Paragraph('Monthly Trend (Last 12 Months)', styles['Heading2']))
+        trend_rows = [['Month', 'Income', 'Spending', 'Net Savings']] + (
+            [
+                [
+                    datetime(year, month, 1).strftime('%b %Y'),
+                    f'Rs. {monthly_income.get((year, month), 0):,.2f}',
+                    f'Rs. {monthly_spend.get((year, month), 0):,.2f}',
+                    f'Rs. {monthly_income.get((year, month), 0) - monthly_spend.get((year, month), 0):,.2f}',
+                ]
+                for year, month in months_seen
+            ] if months_seen else [['No transaction history yet', '', '', '']]
+        )
+        elements.append(_report_table(trend_rows, col_widths=[120, 130, 130, 130]))
+        elements.append(Spacer(1, 20))
+
+        # --- Budget Summary (current month, always-current - matches the Budgets page) ---
+        month_start, month_end = _current_month_range()
+        budgets = Budget.query.filter_by(user_id=user_id).all()
+        elements.append(Paragraph('Budget Summary (Current Month)', styles['Heading2']))
+        if budgets:
+            budget_rows = [['Category', 'Limit', 'Spent', 'Remaining', '% Used']]
+            for b in budgets:
+                # trend_txns already covers the last 12 months, which always includes
+                # the current month, so this doesn't need a second database query.
+                spent = sum(
+                    float(t.amount) for t in trend_txns
+                    if t.category_id == b.category_id and t.transaction_type == 'debit'
+                    and month_start <= t.transaction_date <= month_end
+                )
+                limit = float(b.monthly_limit)
+                budget_rows.append([
+                    b.category.name if b.category else 'Unknown',
+                    f'Rs. {limit:,.2f}',
+                    f'Rs. {spent:,.2f}',
+                    f'Rs. {max(limit - spent, 0):,.2f}',
+                    f'{round((spent / limit) * 100, 1) if limit > 0 else 0}%',
+                ])
+        else:
+            budget_rows = [['Category', 'Limit', 'Spent', 'Remaining', '% Used'], ['No budgets set yet', '', '', '', '']]
+        elements.append(_report_table(budget_rows, col_widths=[150, 100, 100, 100, 80]))
+        elements.append(Spacer(1, 20))
+
+        # --- Savings Goals (always-current - matches the Goals page) ---
+        goals = Goal.query.filter_by(user_id=user_id).all()
+        elements.append(Paragraph('Savings Goals', styles['Heading2']))
+        if goals:
+            goal_rows = [['Goal', 'Target', 'Current', 'Progress', 'Target Date']]
+            for g in goals:
+                target, current = float(g.target_amount), float(g.current_amount)
+                percent = round(min((current / target) * 100, 100), 1) if target > 0 else 0
+                goal_rows.append([
+                    g.name,
+                    f'Rs. {target:,.2f}',
+                    f'Rs. {current:,.2f}',
+                    f'{percent}%',
+                    g.target_date.isoformat() if g.target_date else 'No deadline',
+                ])
+        else:
+            goal_rows = [['Goal', 'Target', 'Current', 'Progress', 'Target Date'], ['No goals set yet', '', '', '', '']]
+        elements.append(_report_table(goal_rows, col_widths=[140, 100, 100, 80, 110]))
+        elements.append(Spacer(1, 20))
+
+        # --- Transaction Details (most recent 100 of the filtered set, to keep the PDF readable) ---
+        elements.append(Paragraph('Transaction Details', styles['Heading2']))
+        txn_rows = [['Date', 'Description', 'Category', 'Amount']] + (
+            [
+                [t.transaction_date.isoformat(), t.description[:40],
+                 t.category.name if t.category else 'Other', f'Rs. {float(t.amount):,.2f}']
+                for t in transactions[:100]
+            ] if transactions else [['No transactions for this period', '', '', '']]
+        )
+        elements.append(_report_table(txn_rows, col_widths=[70, 220, 100, 80], right_align_from=3))
 
         doc.build(elements)
         buffer.seek(0)

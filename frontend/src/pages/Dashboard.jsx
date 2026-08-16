@@ -134,6 +134,14 @@ const Dashboard = () => {
           >
             {exporting === 'csv' ? 'Exporting...' : 'Export CSV'}
           </button>
+          <button
+            onClick={() => handleExport('pdf')}
+            disabled={exporting !== null}
+            title="Detailed PDF report: summary, categories, top merchants, monthly trend, budgets, goals, and transactions"
+            className="bg-white border border-gray-200 hover:bg-gray-50 text-gray-700 font-semibold py-2 px-4 rounded-full text-sm shadow-sm disabled:opacity-50"
+          >
+            {exporting === 'pdf' ? 'Exporting...' : 'Export PDF'}
+          </button>
           <Link
             to="/upload"
             className="bg-gradient-to-r from-indigo-600 to-purple-600 hover:opacity-90 text-white font-semibold py-2 px-5 rounded-full text-sm shadow-lg shadow-indigo-600/30 transition"

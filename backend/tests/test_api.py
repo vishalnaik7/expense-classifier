@@ -21,6 +21,14 @@ def _upload(client, headers, content=SAMPLE_CSV, filename='statement.csv'):
     )
 
 
+def _get_category_id_for_test(client, headers, name):
+    response = client.get('/api/categories', headers=headers)
+    for cat in response.get_json()['data']:
+        if cat['name'] == name:
+            return cat['id']
+    raise AssertionError(f'Category "{name}" not found in seeded categories')
+
+
 class TestHealthCheck:
     def test_health_check_is_unauthenticated_and_reports_ok(self, client):
         response = client.get('/api/health')
@@ -201,3 +209,30 @@ class TestAnalyticsAndExport:
         assert response.status_code == 200
         assert response.content_type == 'application/pdf'
         assert response.data[:4] == b'%PDF'
+
+    def test_export_pdf_is_a_detailed_report_covering_every_feature_area(self, client, auth_headers):
+        # The PDF report should be a complete standalone snapshot of the app -
+        # not just a transaction list - covering every sidebar feature area.
+        import io as io_module
+        import pdfplumber
+
+        _upload(client, auth_headers)
+
+        groceries_id = _get_category_id_for_test(client, auth_headers, 'Groceries')
+        client.post('/api/budgets', json={'category_id': groceries_id, 'monthly_limit': 5000}, headers=auth_headers)
+        client.post('/api/goals', json={'name': 'Emergency Fund', 'target_amount': 100000}, headers=auth_headers)
+
+        response = client.get('/api/export/pdf', headers=auth_headers)
+        assert response.status_code == 200
+
+        with pdfplumber.open(io_module.BytesIO(response.data)) as pdf:
+            full_text = '\n'.join(page.extract_text() or '' for page in pdf.pages)
+
+        for heading in [
+            'Summary', 'Spending by Category', 'Top Merchants',
+            'Monthly Trend', 'Budget Summary', 'Savings Goals', 'Transaction Details',
+        ]:
+            assert heading in full_text, f'"{heading}" section missing from the PDF report'
+
+        assert 'Emergency Fund' in full_text
+        assert 'Groceries' in full_text
