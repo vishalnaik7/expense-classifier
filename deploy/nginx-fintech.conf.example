@@ -1,0 +1,59 @@
+# Reference nginx config for running this app behind an existing nginx on
+# a shared server (e.g. an EC2 instance also hosting other projects) -
+# used for the docker-compose.prod.yml deployment. Copy to
+# /etc/nginx/sites-available/fintech, adjust server_name / cert paths,
+# then `ln -s` into sites-enabled and reload nginx.
+#
+# Backend runs in Docker (docker-compose.prod.yml), bound to
+# 127.0.0.1:5000 only - never exposed directly to the internet, only
+# reachable through this nginx proxy. Frontend is NOT a Docker container
+# here: it's built once (`npm run build`) and served as static files
+# directly by this nginx block, to avoid running a second Node.js process
+# on a memory-constrained host.
+#
+# HTTPS below uses a self-signed certificate as a placeholder - swap in a
+# real Let's Encrypt certificate once your environment can serve port 80
+# to the public internet without another service on the same host
+# intercepting it (see the caveat below).
+#
+# CAVEAT: if another Docker container on this host publishes host port 80
+# (`-p 80:80`), Docker's iptables DNAT rule for that container will
+# intercept ALL external port-80 traffic before it reaches nginx,
+# regardless of Host header - this silently breaks both the HTTP->HTTPS
+# redirect below and any Let's Encrypt HTTP-01 challenge for this domain.
+# Port 443 is unaffected unless something else also publishes it. Check
+# `sudo iptables -t nat -L DOCKER -n` for existing `dpt:80` rules before
+# assuming Let's Encrypt will work.
+
+server {
+    listen 80;
+    server_name fintech.example.com;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    server_name fintech.example.com;
+
+    ssl_certificate /etc/ssl/certs/fintech.crt;
+    ssl_certificate_key /etc/ssl/private/fintech.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+
+    # Static frontend build (frontend/build/ after `npm run build` with
+    # REACT_APP_API_URL baked in - see INSTALLATION.md).
+    location / {
+        root /var/www/fintech;
+        try_files $uri /index.html;
+    }
+
+    # Backend API, proxied to the Docker container on localhost only.
+    location /api/ {
+        proxy_pass http://127.0.0.1:5000/api/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        client_max_body_size 12M;
+    }
+}

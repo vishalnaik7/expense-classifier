@@ -688,9 +688,57 @@ Point either at this repo's `frontend/` folder (Create React App preset
 works out of the box); set `REACT_APP_API_URL` to your Render backend's
 URL from step 2.
 
+### Option C: AWS EC2 (or any self-managed Docker host, including a shared box)
+
+If you already have a Linux server (EC2 or otherwise) - possibly one
+already running other projects behind the same nginx - deploy the
+backend as a Docker container and the frontend as static files served by
+your existing nginx, rather than a second Docker container per service:
+
+**1. Backend**
+```bash
+git clone https://github.com/<you>/expense-classifier.git
+cd expense-classifier/backend
+cp .env.example .env
+# Edit .env: JWT_SECRET_KEY (openssl rand -hex 32), CORS_ORIGINS (your
+# domain), AI_PROVIDER=groq, GROQ_API_KEY. For a memory-constrained box,
+# leave DATABASE_URL as the SQLite default rather than adding a second
+# Postgres container.
+cd ..
+docker compose -f docker-compose.prod.yml -p fintech up -d --build
+```
+`docker-compose.prod.yml` binds the backend to `127.0.0.1:5000` only (not
+exposed to the internet directly - only reachable through nginx) and
+persists the SQLite file on a named volume. On a low-RAM host, the
+compose file's `command:` already reduces gunicorn to 1 worker; increase
+it if the host has more headroom.
+
+**2. Frontend** - built once and served as static files by your existing
+nginx (no second Docker container, no extra Node.js process at runtime):
+```bash
+cd frontend
+echo "REACT_APP_API_URL=https://<your-domain>/api" > .env.production.local
+npm install && npm run build
+sudo mkdir -p /var/www/fintech && sudo cp -r build/* /var/www/fintech/
+```
+
+**3. nginx** - see [deploy/nginx-fintech.conf.example](deploy/nginx-fintech.conf.example)
+for a ready-to-adapt server block (static frontend + `/api/` proxied to
+the container). **Read the caveat in that file before running certbot**:
+if another Docker container on the host already publishes host port 80,
+Docker's iptables rule for it silently intercepts *all* external port-80
+traffic before nginx ever sees it - for any domain, not just that
+container's own - which breaks Let's Encrypt's HTTP-01 challenge with no
+obvious error pointing at the real cause. Check
+`sudo iptables -t nat -L DOCKER -n` for existing `dpt:80` rules first. If
+one exists and you can't remap it, a self-signed certificate
+(`openssl req -x509 -nodes -days 825 -newkey rsa:2048 ...`) is the
+pragmatic fallback - real encryption, just a one-time browser warning
+instead of a trusted cert chain.
+
 ### AI provider - [Groq](https://console.groq.com) (free tier)
 
-Needed by either option above. Sign up, create an API key, and set
+Needed by any option above. Sign up, create an API key, and set
 `GROQ_API_KEY` + `AI_PROVIDER=groq` on the backend service's environment
 variables. This is what serves the AI Assistant chat, goal savings
 advice, and the CSV/PDF AI-parsing fallback in production - Ollama (used

@@ -1,0 +1,20 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: fintech_backend
+    restart: unless-stopped
+    env_file:
+      - ./backend/.env
+    ports:
+      - "127.0.0.1:5000:5000"
+    volumes:
+      - fintech_sqlite_data:/app/data
+    # Reduce this on a memory-constrained host (e.g. a shared/small EC2
+    # instance) - 1 worker instead of the Dockerfile's default 2 to keep
+    # the footprint small. Bump it back up on a dedicated/larger box.
+    command: gunicorn -w 1 -b 0.0.0.0:5000 main:app
+
+volumes:
+  fintech_sqlite_data:
