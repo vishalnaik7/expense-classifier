@@ -38,7 +38,7 @@ class DevelopmentConfig(Config):
     LOG_LEVEL = 'DEBUG'
     SQLALCHEMY_DATABASE_URI = os.getenv(
         'DATABASE_URL',
-        'sqlite:///auth.db'  # ✅ CHANGED FROM PostgreSQL TO SQLite!
+        'sqlite:///auth.db'
     )
 
 

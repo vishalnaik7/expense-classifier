@@ -46,12 +46,14 @@ _PROVIDER_DEFAULTS = {
     },
     'groq': {
         'base_url': 'https://api.groq.com/openai/v1',
-        'model': 'llama-3.3-70b-versatile',
-        # Groq's vision-capable model lineup changes fairly often (these
-        # are frequently offered as "preview" models) - verify the current
-        # name at https://console.groq.com/docs/models and override via
-        # AI_VISION_MODEL if this default has been retired.
-        'vision_model': 'llama-3.2-11b-vision-preview',
+        'model': 'openai/gpt-oss-120b',
+        # Groq's model lineup changes fairly often, including full
+        # decommissions of models still referenced elsewhere in their own
+        # docs - verify the current name at
+        # https://console.groq.com/docs/models (or /docs/vision for
+        # multimodal models) and override via AI_MODEL/AI_VISION_MODEL if
+        # this default has been retired.
+        'vision_model': 'qwen/qwen3.6-27b',
     },
 }
 

@@ -1,6 +1,5 @@
 """
-Fintech Expense Classifier - Flask Backend (FIXED VERSION)
-Complete working implementation with proper JWT handling
+Fintech Expense Classifier - Flask Backend
 """
 
 from flask import Flask, request, jsonify, send_file

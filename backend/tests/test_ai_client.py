@@ -71,7 +71,7 @@ class TestGroqProvider:
         mod = _reload()
         client = mod.get_client()
         assert str(client.base_url).rstrip('/') == 'https://api.groq.com/openai/v1'
-        assert mod.get_model() == 'llama-3.3-70b-versatile'
+        assert mod.get_model() == 'openai/gpt-oss-120b'
 
     def test_get_client_raises_without_key(self, monkeypatch):
         monkeypatch.setenv('AI_PROVIDER', 'groq')
@@ -86,7 +86,7 @@ class TestGroqProvider:
         monkeypatch.setenv('GROQ_API_KEY', 'gsk-test-key')
         monkeypatch.delenv('AI_VISION_MODEL', raising=False)
         mod = _reload()
-        assert mod.get_vision_model() == 'llama-3.2-11b-vision-preview'
+        assert mod.get_vision_model() == 'qwen/qwen3.6-27b'
 
 
 class TestUnknownProvider:
