@@ -115,6 +115,86 @@ class TestExtractFromImages:
             with pytest.raises(LLMExtractionError, match='malformed JSON'):
                 bedrock_vision.extract_transactions_from_images([b'fake-png-bytes'])
 
+    def test_strips_markdown_code_fence_before_parsing(self, monkeypatch):
+        # Observed live with Nova Lite: it wraps its JSON reply in a
+        # ```json ... ``` fence despite the prompt explicitly saying not
+        # to, which broke json.loads outright before this was handled.
+        monkeypatch.setenv('AWS_ACCESS_KEY_ID', 'AKIATEST')
+        monkeypatch.setenv('AWS_SECRET_ACCESS_KEY', 'secret')
+        fenced_json = '```json\n' + json.dumps({'transactions': [
+            {'date': '2026-05-05', 'description': 'Txn A', 'amount': 100.0, 'type': 'DEBIT', 'balance': None},
+        ]}) + '\n```'
+        mock_client = MagicMock()
+        mock_client.converse.return_value = {
+            'output': {'message': {'content': [{'text': fenced_json}]}},
+            'stopReason': 'end_turn',
+        }
+
+        with patch.object(bedrock_vision, '_client', return_value=mock_client):
+            transactions, _ = bedrock_vision.extract_transactions_from_images([b'fake-png-bytes'])
+
+        assert len(transactions) == 1
+        assert transactions[0]['description'] == 'Txn A'
+
+    def test_raises_clear_error_on_max_tokens_truncation(self, monkeypatch):
+        # Observed live on a real dense HDFC statement: Nova Lite hit its
+        # output token limit mid-JSON, which used to surface as an
+        # unhelpful generic "malformed JSON" error.
+        monkeypatch.setenv('AWS_ACCESS_KEY_ID', 'AKIATEST')
+        monkeypatch.setenv('AWS_SECRET_ACCESS_KEY', 'secret')
+        mock_client = MagicMock()
+        mock_client.converse.return_value = {
+            'output': {'message': {'content': [{'text': '{"transactions": [{"date": "2026-05-0'}]}},
+            'stopReason': 'max_tokens',
+        }
+
+        with patch.object(bedrock_vision, '_client', return_value=mock_client):
+            with pytest.raises(LLMExtractionError, match='cut off before finishing'):
+                bedrock_vision.extract_transactions_from_images([b'fake-png-bytes'])
+
+
+class TestPageBatching:
+    def test_splits_into_batches_and_merges_results(self, monkeypatch):
+        monkeypatch.setenv('AWS_ACCESS_KEY_ID', 'AKIATEST')
+        monkeypatch.setenv('AWS_SECRET_ACCESS_KEY', 'secret')
+        mock_client = MagicMock()
+        mock_client.converse.side_effect = [
+            _converse_response([{'date': '2026-05-01', 'description': 'Txn A', 'amount': 100.0, 'type': 'DEBIT', 'balance': None}]),
+            _converse_response([{'date': '2026-05-02', 'description': 'Txn B', 'amount': 200.0, 'type': 'CREDIT', 'balance': None}]),
+        ]
+
+        with patch.object(bedrock_vision, '_client', return_value=mock_client):
+            pages = [f'\x89PNG-page-{i}'.encode() for i in range(3)]
+            transactions, used_fallback_model = bedrock_vision.extract_transactions_from_images(pages)
+
+        assert used_fallback_model is False
+        assert mock_client.converse.call_count == 2  # batches of MAX_PAGES_PER_REQUEST=2, then 1
+        first_batch_images = [b for b in mock_client.converse.call_args_list[0].kwargs['messages'][0]['content'] if 'image' in b]
+        second_batch_images = [b for b in mock_client.converse.call_args_list[1].kwargs['messages'][0]['content'] if 'image' in b]
+        assert len(first_batch_images) == 2
+        assert len(second_batch_images) == 1
+        assert {t['description'] for t in transactions} == {'Txn A', 'Txn B'}
+
+    def test_one_failed_batch_does_not_lose_other_batches_results(self, monkeypatch):
+        monkeypatch.setenv('AWS_ACCESS_KEY_ID', 'AKIATEST')
+        monkeypatch.setenv('AWS_SECRET_ACCESS_KEY', 'secret')
+        from botocore.exceptions import ClientError
+        mock_client = MagicMock()
+        mock_client.converse.side_effect = [
+            # First batch: both models fail.
+            ClientError({'Error': {'Code': 'AccessDeniedException', 'Message': 'denied'}}, 'Converse'),
+            ClientError({'Error': {'Code': 'AccessDeniedException', 'Message': 'denied'}}, 'Converse'),
+            # Second batch: primary succeeds.
+            _converse_response([{'date': '2026-05-02', 'description': 'Txn B', 'amount': 200.0, 'type': 'CREDIT', 'balance': None}]),
+        ]
+
+        with patch.object(bedrock_vision, '_client', return_value=mock_client):
+            pages = [f'\x89PNG-page-{i}'.encode() for i in range(3)]
+            transactions, _ = bedrock_vision.extract_transactions_from_images(pages)
+
+        assert len(transactions) == 1
+        assert transactions[0]['description'] == 'Txn B'
+
 
 class TestNovaLiteFallback:
     def test_does_not_call_fallback_when_primary_succeeds(self, monkeypatch):
