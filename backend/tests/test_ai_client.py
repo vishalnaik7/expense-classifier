@@ -89,6 +89,62 @@ class TestGroqProvider:
         assert mod.get_vision_model() == 'qwen/qwen3.6-27b'
 
 
+class TestGeminiProvider:
+    def test_not_configured_without_key(self, monkeypatch):
+        monkeypatch.setenv('AI_PROVIDER', 'gemini')
+        monkeypatch.delenv('GEMINI_API_KEY', raising=False)
+        monkeypatch.delenv('AI_API_KEY', raising=False)
+        mod = _reload()
+        assert mod.is_configured() is False
+
+    def test_default_base_url_and_model(self, monkeypatch):
+        monkeypatch.setenv('AI_PROVIDER', 'gemini')
+        monkeypatch.setenv('GEMINI_API_KEY', 'test-key')
+        monkeypatch.delenv('AI_BASE_URL', raising=False)
+        monkeypatch.delenv('AI_MODEL', raising=False)
+        mod = _reload()
+        client = mod.get_client()
+        assert str(client.base_url).rstrip('/') == 'https://generativelanguage.googleapis.com/v1beta/openai'
+        assert mod.get_model() == 'gemini-3.7-flash'
+        assert mod.get_vision_model() == 'gemini-3.7-flash'
+
+    def test_get_client_raises_without_key(self, monkeypatch):
+        monkeypatch.setenv('AI_PROVIDER', 'gemini')
+        monkeypatch.delenv('GEMINI_API_KEY', raising=False)
+        monkeypatch.delenv('AI_API_KEY', raising=False)
+        mod = _reload()
+        with pytest.raises(mod.AIProviderError, match='GEMINI_API_KEY'):
+            mod.get_client()
+
+
+class TestMistralProvider:
+    def test_not_configured_without_key(self, monkeypatch):
+        monkeypatch.setenv('AI_PROVIDER', 'mistral')
+        monkeypatch.delenv('MISTRAL_API_KEY', raising=False)
+        monkeypatch.delenv('AI_API_KEY', raising=False)
+        mod = _reload()
+        assert mod.is_configured() is False
+
+    def test_default_base_url_and_model(self, monkeypatch):
+        monkeypatch.setenv('AI_PROVIDER', 'mistral')
+        monkeypatch.setenv('MISTRAL_API_KEY', 'test-key')
+        monkeypatch.delenv('AI_BASE_URL', raising=False)
+        monkeypatch.delenv('AI_MODEL', raising=False)
+        mod = _reload()
+        client = mod.get_client()
+        assert str(client.base_url).rstrip('/') == 'https://api.mistral.ai/v1'
+        assert mod.get_model() == 'mistral-large-latest'
+        assert mod.get_vision_model() == 'mistral-large-latest'
+
+    def test_get_client_raises_without_key(self, monkeypatch):
+        monkeypatch.setenv('AI_PROVIDER', 'mistral')
+        monkeypatch.delenv('MISTRAL_API_KEY', raising=False)
+        monkeypatch.delenv('AI_API_KEY', raising=False)
+        mod = _reload()
+        with pytest.raises(mod.AIProviderError, match='MISTRAL_API_KEY'):
+            mod.get_client()
+
+
 class TestUnknownProvider:
     def test_is_configured_false_for_none(self, monkeypatch):
         monkeypatch.setenv('AI_PROVIDER', 'none')

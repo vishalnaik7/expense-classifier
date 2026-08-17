@@ -12,20 +12,22 @@ at /v1, which is what this module talks to.
 Production: Ollama cannot be deployed to a serverless/static host like
 Vercel or GitHub Pages - it's a long-running process that keeps multi-GB
 model weights resident in memory and needs persistent disk, none of which
-those platforms provide. Instead, set AI_PROVIDER=groq and GROQ_API_KEY:
-Groq hosts the same class of open-source models (Llama 3.x, etc.) behind
-a free-tier, OpenAI-compatible API with very fast inference.
+those platforms provide. Instead, pick a hosted provider below and set its
+API key; each one hosts open models behind a free/low-cost,
+OpenAI-compatible API with fast inference:
+- AI_PROVIDER=groq, GROQ_API_KEY
+- AI_PROVIDER=gemini, GEMINI_API_KEY
+- AI_PROVIDER=mistral, MISTRAL_API_KEY
 
-Because Ollama and Groq both implement the OpenAI chat-completions wire
+Because every provider here implements the OpenAI chat-completions wire
 format, the rest of the app never needs to know which one is active -
 only AI_PROVIDER/AI_BASE_URL/AI_API_KEY/AI_MODEL change between
 environments, via get_client()/get_model() below. Structured extraction
 (llm_extractor, goal_advisor) uses response_format={"type": "json_object"}
 (JSON mode) rather than strict schema-constrained decoding, since JSON
-mode is the one structured-output feature reliably supported across
-Ollama, Groq, and small open-source models alike - the schema itself is
-described in the prompt and the response is validated/normalized in
-Python after parsing, same as before.
+mode is the one structured-output feature reliably supported across all
+of these providers - the schema itself is described in the prompt and the
+response is validated/normalized in Python after parsing, same as before.
 """
 import os
 from typing import Optional
@@ -54,6 +56,21 @@ _PROVIDER_DEFAULTS = {
         # multimodal models) and override via AI_MODEL/AI_VISION_MODEL if
         # this default has been retired.
         'vision_model': 'qwen/qwen3.6-27b',
+        'api_key_env': 'GROQ_API_KEY',
+    },
+    'gemini': {
+        'base_url': 'https://generativelanguage.googleapis.com/v1beta/openai/',
+        # Natively multimodal - the same model serves both text and vision.
+        'model': 'gemini-3.7-flash',
+        'vision_model': 'gemini-3.7-flash',
+        'api_key_env': 'GEMINI_API_KEY',
+    },
+    'mistral': {
+        'base_url': 'https://api.mistral.ai/v1',
+        # Also natively multimodal (accepts image_url content directly).
+        'model': 'mistral-large-latest',
+        'vision_model': 'mistral-large-latest',
+        'api_key_env': 'MISTRAL_API_KEY',
     },
 }
 
@@ -70,15 +87,29 @@ def is_configured() -> bool:
     Ollama needs no API key - a locally running server is all that's
     required, and if it isn't actually running, that surfaces as a clear
     connection error at call time rather than a static "not configured"
-    check here. A hosted provider like Groq does need a real key.
+    check here. Every hosted provider (Groq, Gemini, Mistral) does need a
+    real key, via its own env var or the generic AI_API_KEY fallback.
     """
     if AI_PROVIDER == 'none':
         return False
     if AI_PROVIDER == 'ollama':
         return True
-    if AI_PROVIDER == 'groq':
-        return bool(os.getenv('GROQ_API_KEY') or os.getenv('AI_API_KEY'))
-    return False
+    provider = _PROVIDER_DEFAULTS.get(AI_PROVIDER)
+    if provider is None:
+        return False
+    return bool(os.getenv(provider['api_key_env']) or os.getenv('AI_API_KEY'))
+
+
+def not_configured_hint() -> str:
+    """
+    A short "how to fix this" hint for callers to append to their own
+    "AI-assisted parsing/chat is not configured" error, naming whichever
+    env var the active provider actually needs.
+    """
+    provider = _PROVIDER_DEFAULTS.get(AI_PROVIDER)
+    if provider is not None:
+        return f"Set {provider['api_key_env']}."
+    return 'Check AI_PROVIDER.'
 
 
 def get_model() -> str:
@@ -110,15 +141,16 @@ def get_client() -> OpenAI:
         base_url = os.getenv('AI_BASE_URL', _PROVIDER_DEFAULTS['ollama']['base_url'])
         return OpenAI(base_url=base_url, api_key='ollama')  # Ollama ignores the key; the SDK requires a non-empty string
 
-    if AI_PROVIDER == 'groq':
-        api_key = os.getenv('GROQ_API_KEY') or os.getenv('AI_API_KEY')
+    provider = _PROVIDER_DEFAULTS.get(AI_PROVIDER)
+    if provider is not None:
+        api_key = os.getenv(provider['api_key_env']) or os.getenv('AI_API_KEY')
         if not api_key:
-            raise AIProviderError('AI_PROVIDER=groq but no GROQ_API_KEY (or AI_API_KEY) is set')
-        base_url = os.getenv('AI_BASE_URL', _PROVIDER_DEFAULTS['groq']['base_url'])
+            raise AIProviderError(f"AI_PROVIDER={AI_PROVIDER} but no {provider['api_key_env']} (or AI_API_KEY) is set")
+        base_url = os.getenv('AI_BASE_URL', provider['base_url'])
         return OpenAI(base_url=base_url, api_key=api_key)
 
     raise AIProviderError(
-        f'Unknown AI_PROVIDER "{AI_PROVIDER}" - expected "ollama" or "groq" (or "none" to disable AI features)'
+        f'Unknown AI_PROVIDER "{AI_PROVIDER}" - expected "ollama", "groq", "gemini", or "mistral" (or "none" to disable AI features)'
     )
 
 
@@ -126,6 +158,7 @@ def connection_hint(error: Exception) -> Optional[str]:
     """A friendlier hint appended to raw connection errors, based on the active provider."""
     if AI_PROVIDER == 'ollama':
         return 'Is Ollama running locally? Start it with `ollama serve` and make sure the model is pulled (`ollama pull llama3.1`).'
-    if AI_PROVIDER == 'groq':
-        return 'Check that GROQ_API_KEY is valid and Groq is reachable.'
+    provider = _PROVIDER_DEFAULTS.get(AI_PROVIDER)
+    if provider is not None:
+        return f"Check that {provider['api_key_env']} is valid and {AI_PROVIDER.capitalize()} is reachable."
     return None

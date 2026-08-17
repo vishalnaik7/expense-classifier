@@ -168,7 +168,7 @@ def extract_transactions(file_content: bytes) -> List[Dict]:
     if not is_configured():
         raise LLMExtractionError(
             'AI-assisted parsing is not configured. '
-            + ('Set GROQ_API_KEY.' if ai_client.AI_PROVIDER == 'groq' else 'Check AI_PROVIDER.')
+            + ai_client.not_configured_hint()
         )
 
     try:
@@ -210,7 +210,7 @@ def extract_transactions_from_images(image_pages: List[bytes]) -> List[Dict]:
     if not is_configured():
         raise LLMExtractionError(
             'AI-assisted parsing is not configured. '
-            + ('Set GROQ_API_KEY.' if ai_client.AI_PROVIDER == 'groq' else 'Check AI_PROVIDER.')
+            + ai_client.not_configured_hint()
         )
     if not image_pages:
         raise LLMExtractionError('No page images were provided for vision-based extraction')

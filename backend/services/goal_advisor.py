@@ -195,7 +195,7 @@ def generate_insight(context: Dict) -> Dict:
     if not is_configured():
         raise GoalInsightError(
             'AI-assisted advice is not configured. '
-            + ('Set GROQ_API_KEY.' if ai_client.AI_PROVIDER == 'groq' else 'Check AI_PROVIDER.')
+            + ai_client.not_configured_hint()
         )
 
     system = (

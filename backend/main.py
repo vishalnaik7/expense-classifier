@@ -1741,7 +1741,7 @@ def chat_with_assistant():
             }), 400
 
         if not chat_advisor.is_configured():
-            hint = 'Set GROQ_API_KEY on the backend.' if ai_client.AI_PROVIDER == 'groq' else 'Make sure Ollama is running locally, or set AI_PROVIDER.'
+            hint = ai_client.not_configured_hint() if ai_client.AI_PROVIDER != 'ollama' else 'Make sure Ollama is running locally, or set AI_PROVIDER.'
             return jsonify({
                 'success': False,
                 'error': f'The AI Assistant is not configured. {hint}'

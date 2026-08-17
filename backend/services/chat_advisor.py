@@ -141,7 +141,7 @@ def answer_question(context: Dict, message: str, history: Optional[List[Dict]] =
     if not is_configured():
         raise ChatAdvisorError(
             'The AI Assistant is not configured. '
-            + ('Set GROQ_API_KEY.' if ai_client.AI_PROVIDER == 'groq' else 'Check AI_PROVIDER.')
+            + ai_client.not_configured_hint()
         )
 
     system = (
