@@ -16,8 +16,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application
 COPY . .
 
-# Create non-root user
-RUN useradd -m appuser && chown -R appuser:appuser /app
+# Create non-root user, plus a writable /app/data directory for SQLite
+# persistence when a deployment mounts a volume there (e.g. an EC2/Docker
+# deployment using SQLITE_URL=sqlite:////app/data/expense.db instead of
+# Postgres) - Docker initializes a fresh named volume from whatever
+# already exists at the mount point, so this directory's ownership is
+# what the volume ends up with, not root's.
+RUN useradd -m appuser && mkdir -p /app/data && chown -R appuser:appuser /app
 USER appuser
 
 # Railway (and most PaaS) inject a dynamic $PORT at container start, a
