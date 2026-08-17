@@ -701,17 +701,30 @@ git clone https://github.com/<you>/expense-classifier.git
 cd expense-classifier/backend
 cp .env.example .env
 # Edit .env: JWT_SECRET_KEY (openssl rand -hex 32), CORS_ORIGINS (your
-# domain), AI_PROVIDER=groq, GROQ_API_KEY. For a memory-constrained box,
-# leave DATABASE_URL as the SQLite default rather than adding a second
-# Postgres container.
+# domain), AI_PROVIDER=groq, GROQ_API_KEY.
+#
+# DATABASE_URL on a memory-constrained box: three options, best to worst
+# for a shared/low-RAM host -
+#   1. A managed database (e.g. AWS RDS Postgres) in the same VPC as the
+#      EC2 instance - offloads the DB process entirely, costs the host
+#      zero RAM. Needs: the RDS security group to allow inbound 5432 from
+#      the EC2 instance's security group (`aws ec2
+#      authorize-security-group-ingress --group-id <rds-sg> --protocol
+#      tcp --port 5432 --source-group <ec2-sg>`), and a
+#      `postgresql://user:pass@<rds-endpoint>:5432/postgres` URL here.
+#   2. SQLite (the default if DATABASE_URL is left unset) - zero extra
+#      process, but data lives only on this host's disk.
+#   3. A second local Postgres container - avoid on a box already tight
+#      on RAM; it's the heaviest of the three options here.
 cd ..
 docker compose -f docker-compose.prod.yml -p fintech up -d --build
 ```
 `docker-compose.prod.yml` binds the backend to `127.0.0.1:5000` only (not
 exposed to the internet directly - only reachable through nginx) and
-persists the SQLite file on a named volume. On a low-RAM host, the
-compose file's `command:` already reduces gunicorn to 1 worker; increase
-it if the host has more headroom.
+persists the SQLite file on a named volume (unused if DATABASE_URL points
+at an external database instead). On a low-RAM host, the compose file's
+`command:` already reduces gunicorn to 1 worker; increase it if the host
+has more headroom.
 
 **2. Frontend** - built once and served as static files by your existing
 nginx (no second Docker container, no extra Node.js process at runtime):
