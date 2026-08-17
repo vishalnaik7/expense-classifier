@@ -557,9 +557,17 @@ def _ai_fallback_parse(extension, file_content):
     that fails - a garbled or unhelpful text layer doesn't always mean
     the rendered page itself is unreadable.
 
-    Vision extraction specifically goes through AWS Bedrock (Claude), not
-    services/ai_client.py's Ollama/Groq/Gemini/Mistral abstraction used
-    everywhere else in this file - see services/bedrock_vision.py.
+    Vision extraction specifically goes through AWS Bedrock (Claude, with
+    an Amazon Nova Lite fallback), not services/ai_client.py's Ollama/
+    Groq/Gemini/Mistral abstraction used everywhere else in this file -
+    see services/bedrock_vision.py.
+
+    Returns:
+        (transactions, used_fallback_model) - used_fallback_model is True
+        only when bedrock_vision fell back to Nova Lite because Claude
+        failed; the caller should treat that case as lower-confidence
+        (see bedrock_vision.extract_transactions_from_images's docstring)
+        and surface a warning rather than trusting it silently.
 
     Raises:
         LLMExtractionError / PDFParsingError: whichever error occurred on
@@ -571,7 +579,7 @@ def _ai_fallback_parse(extension, file_content):
 
     try:
         ai_input = pdf_parser.extract_raw_text(file_content).encode('utf-8') if extension == 'pdf' else file_content
-        return llm_extractor.extract_transactions(ai_input)
+        return llm_extractor.extract_transactions(ai_input), False
     except (LLMExtractionError, PDFParsingError):
         if extension != 'pdf':
             raise
@@ -622,6 +630,7 @@ def upload_csv():
     # fall back to AI-assisted extraction when the configured open-source
     # model provider is ready (see services/ai_client.py) before giving up.
     used_ai_fallback = False
+    used_fallback_model = False
     try:
         if extension == 'pdf':
             parsed_transactions = pdf_parser.parse(file_content)
@@ -645,7 +654,7 @@ def upload_csv():
             }), 422
 
         try:
-            parsed_transactions = _ai_fallback_parse(extension, file_content)
+            parsed_transactions, used_fallback_model = _ai_fallback_parse(extension, file_content)
             used_ai_fallback = True
         except (LLMExtractionError, PDFParsingError) as llm_error:
             upload_record.status = 'failed'
@@ -713,7 +722,12 @@ def upload_csv():
     upload_record.status = 'completed'
     upload_record.parsed_count = inserted_count
     upload_record.duplicate_count = len(in_file_duplicates) + db_duplicate_count
-    if used_ai_fallback:
+    if used_fallback_model:
+        upload_record.error_message = (
+            'Parsed using a lower-confidence AI fallback model (Amazon Nova Lite, since Claude was '
+            'unavailable) — please double-check these transactions for accuracy.'
+        )
+    elif used_ai_fallback:
         upload_record.error_message = (
             'Parsed with AI-assisted extraction — the standard parser could not read this file\'s layout.'
         )
@@ -732,7 +746,8 @@ def upload_csv():
             'upload': upload_record.to_dict(),
             'inserted': inserted_count,
             'duplicates_skipped': upload_record.duplicate_count,
-            'used_ai_fallback': used_ai_fallback
+            'used_ai_fallback': used_ai_fallback,
+            'used_fallback_model': used_fallback_model
         }
     }), 201
 

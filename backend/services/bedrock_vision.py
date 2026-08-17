@@ -25,7 +25,7 @@ if deploying from a region where this differs.
 """
 import json
 import os
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
@@ -106,14 +106,21 @@ def _invoke(model_id: str, content: List[Dict]) -> List[Dict]:
     return transactions
 
 
-def extract_transactions_from_images(image_pages: List[bytes]) -> List[Dict]:
+def extract_transactions_from_images(image_pages: List[bytes]) -> Tuple[List[Dict], bool]:
     """
     Ask a Bedrock model to extract transactions directly from rendered
     bank statement page images - Claude 3.5 Sonnet v2 first, falling back
     to Amazon Nova Lite if that fails for any reason (see module
-    docstring). Same return shape and error type as
-    llm_extractor.extract_transactions_from_images(), which this replaces
-    for the vision fallback specifically.
+    docstring).
+
+    Unlike llm_extractor.extract_transactions_from_images() (same error
+    type, but a plain list return), this returns a (transactions,
+    used_fallback_model) tuple - Nova Lite is a much smaller model than
+    Claude and, in testing, was observed to hallucinate a full fake
+    transaction table from a blank test image rather than reliably
+    reporting "no table found" the way Claude does. Callers should treat
+    used_fallback_model=True as lower-confidence and warn accordingly
+    rather than trusting the result silently.
 
     Raises:
         LLMExtractionError: if Bedrock isn't configured, no images were
@@ -133,12 +140,12 @@ def extract_transactions_from_images(image_pages: List[bytes]) -> List[Dict]:
         content.append({"image": {"format": _IMAGE_FORMAT, "source": {"bytes": image_bytes}}})
 
     try:
-        return _invoke(BEDROCK_MODEL_ID, content)
+        return _invoke(BEDROCK_MODEL_ID, content), False
     except LLMExtractionError as primary_error:
         if BEDROCK_FALLBACK_MODEL_ID == BEDROCK_MODEL_ID:
             raise
         try:
-            return _invoke(BEDROCK_FALLBACK_MODEL_ID, content)
+            return _invoke(BEDROCK_FALLBACK_MODEL_ID, content), True
         except LLMExtractionError as fallback_error:
             raise LLMExtractionError(
                 f'{primary_error} Fallback model also failed: {fallback_error}'

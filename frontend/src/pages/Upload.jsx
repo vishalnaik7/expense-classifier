@@ -237,7 +237,12 @@ const UploadPage = () => {
                           <p className="text-xs text-red-500 mt-1 max-w-[220px]">{u.error_message}</p>
                         )}
                         {u.status === 'completed' && u.error_message && (
-                          <p className="text-xs text-blue-500 mt-1 max-w-[220px]">✨ AI-assisted parse</p>
+                          <p className={`text-xs mt-1 max-w-[220px] ${
+                            u.error_message.includes('lower-confidence') ? 'text-amber-600 font-medium' : 'text-blue-500'
+                          }`}>
+                            {u.error_message.includes('lower-confidence') ? '⚠️ ' : '✨ '}
+                            {u.error_message.includes('lower-confidence') ? u.error_message : 'AI-assisted parse'}
+                          </p>
                         )}
                       </td>
                       <td className="py-2 px-3 text-right">{u.parsed_count}</td>

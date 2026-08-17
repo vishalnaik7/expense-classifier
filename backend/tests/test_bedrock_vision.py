@@ -54,8 +54,9 @@ class TestExtractFromImages:
         mock_client.converse.return_value = response
 
         with patch.object(bedrock_vision, '_client', return_value=mock_client):
-            transactions = bedrock_vision.extract_transactions_from_images([b'\x89PNG-page-one', b'\x89PNG-page-two'])
+            transactions, used_fallback_model = bedrock_vision.extract_transactions_from_images([b'\x89PNG-page-one', b'\x89PNG-page-two'])
 
+        assert used_fallback_model is False
         assert len(transactions) == 1
         assert transactions[0]['amount'] == 11611.0
         assert transactions[0]['type'] == 'debit'
@@ -125,8 +126,9 @@ class TestNovaLiteFallback:
         ])
 
         with patch.object(bedrock_vision, '_client', return_value=mock_client):
-            bedrock_vision.extract_transactions_from_images([b'fake-png-bytes'])
+            _, used_fallback_model = bedrock_vision.extract_transactions_from_images([b'fake-png-bytes'])
 
+        assert used_fallback_model is False
         assert mock_client.converse.call_count == 1
         assert mock_client.converse.call_args.kwargs['modelId'] == bedrock_vision.BEDROCK_MODEL_ID
 
@@ -148,8 +150,9 @@ class TestNovaLiteFallback:
         ]
 
         with patch.object(bedrock_vision, '_client', return_value=mock_client):
-            transactions = bedrock_vision.extract_transactions_from_images([b'fake-png-bytes'])
+            transactions, used_fallback_model = bedrock_vision.extract_transactions_from_images([b'fake-png-bytes'])
 
+        assert used_fallback_model is True
         assert len(transactions) == 1
         assert transactions[0]['description'] == 'Txn via Nova'
         assert mock_client.converse.call_count == 2

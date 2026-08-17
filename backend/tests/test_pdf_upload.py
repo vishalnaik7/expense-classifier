@@ -160,13 +160,14 @@ def test_pdf_with_no_extractable_text_goes_straight_to_vision_fallback(client, a
         'raw_amount': 11611.0,
     }]
 
-    with patch.object(main_module.bedrock_vision, 'extract_transactions_from_images', return_value=fake_transactions) as mock_vision, \
+    with patch.object(main_module.bedrock_vision, 'extract_transactions_from_images', return_value=(fake_transactions, False)) as mock_vision, \
             patch.object(main_module.llm_extractor, 'extract_transactions') as mock_text:
         response = _upload(client, auth_headers, content=image_only_pdf, filename='hdfc_no_text.pdf')
 
     assert response.status_code == 201
     body = response.get_json()
     assert body['data']['used_ai_fallback'] is True
+    assert body['data']['used_fallback_model'] is False
     mock_vision.assert_called_once()
     mock_text.assert_not_called()  # text-based fallback would have nothing to read, so it must be skipped
 
@@ -194,10 +195,38 @@ def test_pdf_vision_fallback_used_when_text_fallback_also_fails(client, auth_hea
     }]
 
     with patch.object(main_module.llm_extractor, 'extract_transactions', side_effect=main_module.LLMExtractionError('AI could not find a transaction table in this file')), \
-            patch.object(main_module.bedrock_vision, 'extract_transactions_from_images', return_value=fake_transactions) as mock_vision:
+            patch.object(main_module.bedrock_vision, 'extract_transactions_from_images', return_value=(fake_transactions, False)) as mock_vision:
         response = _upload(client, auth_headers, content=buffer.getvalue(), filename='unreadable.pdf')
 
     assert response.status_code == 201
     body = response.get_json()
     assert body['data']['used_ai_fallback'] is True
     mock_vision.assert_called_once()
+
+
+def test_upload_warns_when_nova_lite_fallback_model_was_used(client, auth_headers, monkeypatch):
+    # When bedrock_vision reports it had to fall back to Nova Lite
+    # (Claude failed), the upload should surface that as a lower-
+    # confidence warning rather than treating it like an ordinary
+    # AI-assisted parse.
+    monkeypatch.setattr(main_module.bedrock_vision, 'is_configured', lambda: True)
+    image_only_pdf = _build_image_only_pdf(['Date Narration Withdrawal Deposit', '05/05/26 ACH D 11611.00'])
+
+    fake_transactions = [{
+        'date': '2026-05-05',
+        'description': 'ACH D- HDFC BANK LTD',
+        'amount': 11611.0,
+        'type': 'debit',
+        'hash': 'fakevisionhash789',
+        'raw_amount': 11611.0,
+    }]
+
+    with patch.object(main_module.bedrock_vision, 'extract_transactions_from_images', return_value=(fake_transactions, True)):
+        response = _upload(client, auth_headers, content=image_only_pdf, filename='hdfc_no_text.pdf')
+
+    assert response.status_code == 201
+    body = response.get_json()
+    assert body['data']['used_ai_fallback'] is True
+    assert body['data']['used_fallback_model'] is True
+    assert 'Nova Lite' in body['data']['upload']['error_message']
+    assert 'double-check' in body['data']['upload']['error_message']
