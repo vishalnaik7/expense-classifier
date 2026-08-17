@@ -148,7 +148,7 @@ def test_pdf_with_no_extractable_text_goes_straight_to_vision_fallback(client, a
     # nothing for a text-based AI fallback to read - the endpoint should
     # skip straight to vision-based extraction rather than making a
     # doomed text-based attempt first.
-    monkeypatch.setattr(main_module.llm_extractor, 'is_configured', lambda: True)
+    monkeypatch.setattr(main_module.bedrock_vision, 'is_configured', lambda: True)
     image_only_pdf = _build_image_only_pdf(['Date Narration Withdrawal Deposit', '05/05/26 ACH D 11611.00'])
 
     fake_transactions = [{
@@ -160,7 +160,7 @@ def test_pdf_with_no_extractable_text_goes_straight_to_vision_fallback(client, a
         'raw_amount': 11611.0,
     }]
 
-    with patch.object(main_module.llm_extractor, 'extract_transactions_from_images', return_value=fake_transactions) as mock_vision, \
+    with patch.object(main_module.bedrock_vision, 'extract_transactions_from_images', return_value=fake_transactions) as mock_vision, \
             patch.object(main_module.llm_extractor, 'extract_transactions') as mock_text:
         response = _upload(client, auth_headers, content=image_only_pdf, filename='hdfc_no_text.pdf')
 
@@ -179,6 +179,7 @@ def test_pdf_vision_fallback_used_when_text_fallback_also_fails(client, auth_hea
     # still can't find a transaction table, should still get a vision
     # attempt as a last resort before giving up entirely.
     monkeypatch.setattr(main_module.llm_extractor, 'is_configured', lambda: True)
+    monkeypatch.setattr(main_module.bedrock_vision, 'is_configured', lambda: True)
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=letter)
     doc.build([Table([['Foo', 'Bar'], ['1', '2']], style=_GRID_STYLE)])
@@ -193,7 +194,7 @@ def test_pdf_vision_fallback_used_when_text_fallback_also_fails(client, auth_hea
     }]
 
     with patch.object(main_module.llm_extractor, 'extract_transactions', side_effect=main_module.LLMExtractionError('AI could not find a transaction table in this file')), \
-            patch.object(main_module.llm_extractor, 'extract_transactions_from_images', return_value=fake_transactions) as mock_vision:
+            patch.object(main_module.bedrock_vision, 'extract_transactions_from_images', return_value=fake_transactions) as mock_vision:
         response = _upload(client, auth_headers, content=buffer.getvalue(), filename='unreadable.pdf')
 
     assert response.status_code == 201

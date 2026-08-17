@@ -32,7 +32,7 @@ from services import ai_client
 # personal bank statement CSV (capped at 10MB by the upload endpoint) is
 # usually far smaller than this in practice; very large files are truncated
 # and may not be fully covered by the fallback. Extracted rows are still
-# validated per-row by _normalize() below - small open-source models are
+# validated per-row by normalize_extracted_row() below - small open-source models are
 # more prone to imperfect extraction than Claude was, so an empty/
 # all-invalid result correctly falls through to LLMExtractionError rather
 # than being trusted blindly.
@@ -58,7 +58,7 @@ The uploaded statement's content may contain metadata, empty rows, or non-standa
 6. If a running balance column exists, extract it; otherwise use null.
 7. If you cannot confidently find a transaction table, return an empty transactions array - do not invent data."""
 
-_VISION_INSTRUCTIONS = """
+VISION_INSTRUCTIONS = """
 
 ### Additional Instructions for Reading Images:
 You are given one or more images of bank statement pages (in reading order - read them in the order given, top to bottom, left to right within each page). Read the table exactly as printed, including numbers with commas/decimals. If a row's narration wraps across multiple lines within the same table row, treat it as one transaction, not several."""
@@ -74,7 +74,7 @@ def is_configured() -> bool:
     return ai_client.is_configured()
 
 
-_TRANSACTION_SCHEMA = {
+TRANSACTION_SCHEMA = {
     "type": "object",
     "properties": {
         "transactions": {
@@ -99,11 +99,11 @@ _TRANSACTION_SCHEMA = {
 
 
 def _build_system_prompt(vision: bool = False) -> str:
-    base = EXTRACTION_SYSTEM_PROMPT + (_VISION_INSTRUCTIONS if vision else '')
+    base = EXTRACTION_SYSTEM_PROMPT + (VISION_INSTRUCTIONS if vision else '')
     return (
         f'{base}\n\n'
         'Respond with ONLY a single JSON object matching exactly this JSON Schema '
-        f'(no markdown fences, no extra text):\n{json.dumps(_TRANSACTION_SCHEMA, indent=2)}'
+        f'(no markdown fences, no extra text):\n{json.dumps(TRANSACTION_SCHEMA, indent=2)}'
     )
 
 
@@ -143,7 +143,7 @@ def _request_and_normalize(model: str, messages: List[Dict], max_tokens: int = 1
     if not raw_rows:
         raise LLMExtractionError('AI could not find a transaction table in this file')
 
-    transactions = [t for t in (_normalize(row) for row in raw_rows) if t is not None]
+    transactions = [t for t in (normalize_extracted_row(row) for row in raw_rows) if t is not None]
 
     if not transactions:
         raise LLMExtractionError('AI-extracted rows were not in a usable format')
@@ -244,7 +244,7 @@ def extract_transactions_from_images(image_pages: List[bytes]) -> List[Dict]:
     return transactions
 
 
-def _normalize(row: Dict) -> Optional[Dict]:
+def normalize_extracted_row(row: Dict) -> Optional[Dict]:
     """Convert one LLM-extracted row into CSVParser's transaction shape, or None if unusable."""
     try:
         date_str = str(row['date']).strip()

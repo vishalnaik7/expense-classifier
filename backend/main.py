@@ -30,6 +30,7 @@ from services.goal_advisor import GoalInsightError
 from services import chat_advisor
 from services.chat_advisor import ChatAdvisorError
 from services import ai_client
+from services import bedrock_vision
 
 from reportlab.lib.pagesizes import letter
 from reportlab.lib import colors
@@ -556,13 +557,17 @@ def _ai_fallback_parse(extension, file_content):
     that fails - a garbled or unhelpful text layer doesn't always mean
     the rendered page itself is unreadable.
 
+    Vision extraction specifically goes through AWS Bedrock (Claude), not
+    services/ai_client.py's Ollama/Groq/Gemini/Mistral abstraction used
+    everywhere else in this file - see services/bedrock_vision.py.
+
     Raises:
         LLMExtractionError / PDFParsingError: whichever error occurred on
         the last attempt, for the caller to report.
     """
     if extension == 'pdf' and not pdf_parser.has_extractable_text(file_content):
         images = pdf_parser.render_pages_as_images(file_content)
-        return llm_extractor.extract_transactions_from_images(images)
+        return bedrock_vision.extract_transactions_from_images(images)
 
     try:
         ai_input = pdf_parser.extract_raw_text(file_content).encode('utf-8') if extension == 'pdf' else file_content
@@ -571,7 +576,7 @@ def _ai_fallback_parse(extension, file_content):
         if extension != 'pdf':
             raise
         images = pdf_parser.render_pages_as_images(file_content)
-        return llm_extractor.extract_transactions_from_images(images)
+        return bedrock_vision.extract_transactions_from_images(images)
 
 
 @app.route('/api/uploads', methods=['POST'])
@@ -623,7 +628,12 @@ def upload_csv():
         else:
             parsed_transactions = CSVParser(file_content).parse()
     except (CSVParsingError, PDFParsingError) as parse_error:
-        if not llm_extractor.is_configured():
+        # A PDF can still be rescued by vision extraction (Bedrock, see
+        # bedrock_vision.py) even if llm_extractor's own provider (Groq/
+        # Gemini/Mistral/Ollama) isn't configured - only a CSV has no
+        # vision path to fall back to, since there's no page to render.
+        ai_fallback_available = llm_extractor.is_configured() or (extension == 'pdf' and bedrock_vision.is_configured())
+        if not ai_fallback_available:
             upload_record.status = 'failed'
             upload_record.error_message = str(parse_error)
             db.session.commit()
