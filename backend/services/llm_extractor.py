@@ -38,6 +38,12 @@ from services import ai_client
 # than being trusted blindly.
 MAX_INPUT_CHARS = 60000
 
+# Vision models commonly cap how many images can go in a single request
+# (e.g. Groq's qwen/qwen3.6-27b allows at most 3) - batch page images into
+# groups of this size and merge the extracted transactions across
+# requests, rather than sending every rendered page at once.
+MAX_IMAGES_PER_REQUEST = 3
+
 EXTRACTION_SYSTEM_PROMPT = """You are an expert AI data extraction engine specializing in messy financial documents and bank statements.
 
 ### Problem Context:
@@ -209,19 +215,33 @@ def extract_transactions_from_images(image_pages: List[bytes]) -> List[Dict]:
     if not image_pages:
         raise LLMExtractionError('No page images were provided for vision-based extraction')
 
-    content = [{
-        "type": "text",
-        "text": "Extract every transaction visible in these bank statement page images, in the order given:",
-    }]
-    for image_bytes in image_pages:
-        encoded = base64.b64encode(image_bytes).decode('ascii')
-        content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}"}})
+    model = ai_client.get_vision_model()
+    transactions: List[Dict] = []
+    last_error: Optional[LLMExtractionError] = None
 
-    messages = [
-        {"role": "system", "content": _build_system_prompt(vision=True)},
-        {"role": "user", "content": content},
-    ]
-    return _request_and_normalize(ai_client.get_vision_model(), messages)
+    for start in range(0, len(image_pages), MAX_IMAGES_PER_REQUEST):
+        batch = image_pages[start:start + MAX_IMAGES_PER_REQUEST]
+        content = [{
+            "type": "text",
+            "text": "Extract every transaction visible in these bank statement page images, in the order given:",
+        }]
+        for image_bytes in batch:
+            encoded = base64.b64encode(image_bytes).decode('ascii')
+            content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}"}})
+
+        messages = [
+            {"role": "system", "content": _build_system_prompt(vision=True)},
+            {"role": "user", "content": content},
+        ]
+        try:
+            transactions.extend(_request_and_normalize(model, messages))
+        except LLMExtractionError as e:
+            last_error = e
+
+    if not transactions:
+        raise last_error or LLMExtractionError('AI could not find a transaction table in this file')
+
+    return transactions
 
 
 def _normalize(row: Dict) -> Optional[Dict]:

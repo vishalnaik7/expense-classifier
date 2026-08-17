@@ -165,6 +165,48 @@ class TestExtractFromImages:
         for block in image_blocks:
             assert block['image_url']['url'].startswith('data:image/png;base64,')
 
+    def test_batches_more_than_max_images_per_request(self, monkeypatch):
+        # Vision models commonly cap images per request (e.g. Groq's
+        # qwen/qwen3.6-27b allows at most 3) - five page images should
+        # split into two requests (3 then 2) with results merged.
+        monkeypatch.setattr(ai_client, 'is_configured', lambda: True)
+        responses = [
+            _make_response([
+                {'date': '2026-05-01', 'description': 'Txn A', 'amount': 100.0, 'type': 'DEBIT', 'balance': None},
+            ]),
+            _make_response([
+                {'date': '2026-05-02', 'description': 'Txn B', 'amount': 200.0, 'type': 'CREDIT', 'balance': None},
+            ]),
+        ]
+
+        with patch.object(ai_client, 'get_client') as mock_get_client:
+            mock_create = mock_get_client.return_value.chat.completions.create
+            mock_create.side_effect = responses
+            pages = [f'\x89PNG-page-{i}'.encode() for i in range(5)]
+            transactions = extract_transactions_from_images(pages)
+
+        assert mock_create.call_count == 2
+        first_call_images = [b for b in mock_create.call_args_list[0].kwargs['messages'][1]['content'] if b['type'] == 'image_url']
+        second_call_images = [b for b in mock_create.call_args_list[1].kwargs['messages'][1]['content'] if b['type'] == 'image_url']
+        assert len(first_call_images) == 3
+        assert len(second_call_images) == 2
+        assert {t['description'] for t in transactions} == {'Txn A', 'Txn B'}
+
+    def test_partial_batch_failure_still_returns_successful_transactions(self, monkeypatch):
+        monkeypatch.setattr(ai_client, 'is_configured', lambda: True)
+        ok_response = _make_response([
+            {'date': '2026-05-01', 'description': 'Txn A', 'amount': 100.0, 'type': 'DEBIT', 'balance': None},
+        ])
+
+        with patch.object(ai_client, 'get_client') as mock_get_client:
+            mock_create = mock_get_client.return_value.chat.completions.create
+            mock_create.side_effect = [ok_response, RuntimeError('network down')]
+            pages = [f'\x89PNG-page-{i}'.encode() for i in range(5)]
+            transactions = extract_transactions_from_images(pages)
+
+        assert len(transactions) == 1
+        assert transactions[0]['description'] == 'Txn A'
+
     def test_raises_when_no_transactions_found(self, monkeypatch):
         monkeypatch.setattr(ai_client, 'is_configured', lambda: True)
         mock_response = _make_response([])
