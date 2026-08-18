@@ -129,7 +129,7 @@ def extract_transaction_csv(file_content: bytes) -> str:
     except PDFParsingError:
         raise
     except Exception as e:
-        raise PDFParsingError(f'Could not read PDF file: {e}')
+        raise PDFParsingError(f'Could not read PDF file: {str(e) or type(e).__name__}')
 
     if header is None or not data_rows:
         raise PDFParsingError('Could not find a transaction table in this PDF')
@@ -173,7 +173,7 @@ def extract_raw_text(file_content: bytes) -> str:
                         page_blocks.append(f'--- Page {page_num} ---\n{text}')
             return '\n\n'.join(page_blocks)
     except Exception as e:
-        raise PDFParsingError(f'Could not read PDF file: {e}')
+        raise PDFParsingError(f'Could not read PDF file: {str(e) or type(e).__name__}')
 
 
 def has_extractable_text(file_content: bytes) -> bool:
@@ -227,7 +227,12 @@ def render_pages_as_images(file_content: bytes, max_pages: int = MAX_VISION_PAGE
     except PDFParsingError:
         raise
     except Exception as e:
-        raise PDFParsingError(f'Could not render PDF pages as images: {e}')
+        # Some rendering failures (seen with certain malformed/unusual
+        # PDFs) raise an exception whose str() is empty, which used to
+        # produce an unhelpfully blank error message - fall back to the
+        # exception's type name so there's always something to go on.
+        detail = str(e) or type(e).__name__
+        raise PDFParsingError(f'Could not render PDF pages as images: {detail}')
 
 
 def parse(file_content: bytes) -> List[dict]:
