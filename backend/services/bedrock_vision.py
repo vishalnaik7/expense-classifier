@@ -8,30 +8,30 @@ through services/ai_client.py's Ollama/Groq/Gemini/Mistral abstraction;
 this module is a separate, narrower path for image-based PDF extraction
 only, using the Bedrock Converse API (boto3's bedrock-runtime client).
 
-This previously also tried Claude 3.5 Sonnet v2 first, with Nova Lite as
-its fallback - Claude was removed because its Bedrock access requires an
-AWS Marketplace subscription that failed in practice
-(INVALID_PAYMENT_INSTRUMENT) independent of IAM permissions or API
-access, so it never actually ran.
+Nova Lite specifically, not one of Bedrock's Claude models, because
+Claude's Bedrock access goes through an AWS Marketplace subscription that
+can fail (INVALID_PAYMENT_INSTRUMENT) independent of IAM permissions or
+API access, while Nova Lite is an Amazon first-party model and isn't
+subject to that.
 
 Pages are sent a few at a time rather than all at once (see
 MAX_PAGES_PER_REQUEST): a dense multi-page statement's transaction list
 can easily exceed a single response's max output tokens, and Nova Lite's
-hard limit (10000, confirmed via a live ValidationException) is too
-small to safely fit an entire statement's JSON in one response - going
-over produces a truncated, unparseable response rather than a clean
-error.
+hard limit (10000 tokens) is too small to safely fit an entire
+statement's JSON in one response - going over produces a truncated,
+unparseable response rather than a clean error.
 
 Credentials are picked up by boto3's standard chain (AWS_ACCESS_KEY_ID /
 AWS_SECRET_ACCESS_KEY env vars, or an EC2 instance role) - never handled
 directly in this module.
 
-Region note: in ap-south-1 (Mumbai), this model requires a cross-region
+Region note: in ap-south-1 (Mumbai), this model needs a cross-region
 inference profile ID rather than the bare model ID for on-demand
-invocation (confirmed via `aws bedrock list-inference-profiles` - the
-bare model ID is listed but not directly invocable on-demand in this
-region). Override BEDROCK_MODEL_ID/AWS_REGION if deploying from a region
-where this differs.
+invocation - the bare model ID is listed by `aws bedrock
+list-foundation-models` but isn't directly invocable here; check `aws
+bedrock list-inference-profiles --region <region>` for the right ID.
+Override BEDROCK_MODEL_ID/AWS_REGION if deploying from a region where
+this differs.
 """
 import json
 import os
@@ -104,9 +104,9 @@ def _invoke(content: List[Dict]) -> List[Dict]:
     if not text_block:
         raise LLMExtractionError(f'AWS Bedrock returned no extractable content ({BEDROCK_MODEL_ID})')
 
-    # Despite the system prompt explicitly saying not to, some models
-    # (observed with Nova Lite) wrap the JSON in a markdown code fence
-    # anyway - strip it defensively rather than failing outright.
+    # Nova Lite sometimes wraps the JSON in a markdown code fence anyway,
+    # despite the system prompt explicitly saying not to - strip it
+    # defensively rather than failing outright.
     if text_block.startswith('```'):
         text_block = re.sub(r'^```(?:json)?\s*', '', text_block)
         text_block = re.sub(r'\s*```$', '', text_block)
@@ -146,12 +146,12 @@ def extract_transactions_from_images(image_pages: List[bytes]) -> List[Dict]:
     statement, as long as at least one batch succeeds.
 
     This is always a lower-confidence result - Nova Lite is a small
-    model and, in testing, was observed to both hallucinate a full fake
-    transaction table from a blank test image and to garble real
-    statement data (invalid dates, corrupted merchant text) on an actual
-    multi-page statement. Callers should treat any result from this
-    module as lower-confidence and warn accordingly rather than trusting
-    it silently - see main.py's _vision_extract_with_fallbacks().
+    model, prone to hallucinating a full fake transaction table from a
+    blank or unclear image and to garbling real statement data (wrong
+    dates, corrupted merchant text) on a dense multi-page statement.
+    Callers should treat any result from this module as lower-confidence
+    and warn accordingly rather than trusting it silently - see main.py's
+    _vision_extract_with_fallbacks().
 
     Raises:
         LLMExtractionError: if Bedrock isn't configured, no images were

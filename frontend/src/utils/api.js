@@ -21,6 +21,26 @@ apiClient.interceptors.request.use(
   (error) => Promise.reject(error)
 );
 
+// A 401 here means the access token is missing, expired, or revoked -
+// send the user straight to the login page instead of leaving them on a
+// page that keeps failing every request with an error message. This
+// clears storage directly (rather than going through the auth store) so
+// there's no circular import between this module and authStore.js, and
+// uses a full page load so no stale in-memory state survives into the
+// next login.
+apiClient.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error.response?.status === 401 && window.location.pathname !== '/login') {
+      localStorage.removeItem('access_token');
+      localStorage.removeItem('refresh_token');
+      localStorage.removeItem('user');
+      window.location.href = '/login';
+    }
+    return Promise.reject(error);
+  }
+);
+
 export const authAPI = {
   signup: (userData) => apiClient.post('/auth/signup', userData),
   login: (email, password) => apiClient.post('/auth/login', { email, password }),

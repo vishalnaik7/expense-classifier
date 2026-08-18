@@ -544,12 +544,12 @@ def _get_or_create_category(name):
     return category
 
 
-# Lower-confidence vision-capable providers to try, in order, if
-# Textract either isn't configured or can't find a recognizable
-# transaction table. All three are generative-AI vision models that, in
-# testing, produced wrong dates, invented transactions, or swapped
-# credit/debit columns on real statements - unlike Textract's OCR-based
-# table detection, which reads what's actually on the page.
+# Further vision-capable providers to try, in order, if Textract either
+# isn't configured or can't find a recognizable transaction table. Both
+# are generative-AI vision models, so - like Bedrock's Nova Lite - they
+# can get a date, a transaction count, or a credit/debit column wrong
+# without raising any error, unlike Textract's OCR-based table detection,
+# which reads what's actually on the page.
 _VISION_FALLBACK_PROVIDERS = ['gemini', 'mistral']
 
 
@@ -573,25 +573,19 @@ def _vision_extract_with_fallbacks(images):
     every generative-AI vision provider (Bedrock's Nova Lite, then each
     provider in _VISION_FALLBACK_PROVIDERS) is tried, and the result with
     the most transactions wins, rather than stopping at the first one
-    that merely doesn't raise an exception.
-
-    This "keep trying and pick the biggest result" approach for the
-    AI-vision tier exists because a model failing loudly (an exception)
-    isn't the only failure mode worth working around - in testing, Nova
-    Lite returned a plausible-looking but badly incomplete/inaccurate
-    result on a real statement without raising at all, which a naive
-    first-success chain would have silently accepted over a fuller/
-    better result from a later provider. Transaction count is an
-    imperfect proxy for accuracy, but it is what's available without a
-    ground truth to check against - the used_fallback_model=True warning
-    this triggers is what actually protects the user, not this
-    heuristic.
+    that merely doesn't raise an exception. A generative model can return
+    a confident-looking but wrong or incomplete result without ever
+    raising an error, so "didn't crash" isn't enough to trust a result
+    over one from another provider - transaction count is an imperfect
+    stand-in for accuracy, but it's what's available without a ground
+    truth to compare against. The used_fallback_model=True warning this
+    triggers is what actually protects the user here, not this
+    tie-breaker.
 
     Returns:
         (transactions, used_fallback_model) - False only for a Textract
-        result; True for anything from the AI-vision tier, since every
-        one of those providers has shown real accuracy problems on real
-        statements and should be treated as lower-confidence.
+        result; True for anything from the AI-vision tier, which should
+        be treated as lower-confidence.
 
     Raises:
         LLMExtractionError / PDFParsingError: from the last tier

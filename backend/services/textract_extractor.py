@@ -5,9 +5,10 @@ extractable text layer at all (see pdf_parser.py's has_extractable_text()
 such a PDF - ahead of the vision-LLM fallbacks in bedrock_vision.py and
 services/ai_client.py's Gemini/Mistral - because Textract's table
 detection is OCR/layout-based rather than generative: it reads what's
-actually on the page instead of an LLM reconstructing a plausible-looking
-JSON from an image, which in testing produced wrong years, invented
-transactions, and swapped credit/debit columns on real statements.
+actually printed on the page instead of a model reconstructing a
+plausible-looking JSON from an image, which is where a generative model
+can quietly get a date, a transaction count, or a credit/debit column
+wrong without any error to show for it.
 
 Textract's AnalyzeDocument (TABLES feature) returns a grid of cells per
 detected table, already row/column-aligned - exactly the same shape
@@ -20,8 +21,8 @@ than needing its own normalization logic.
 
 Credentials are picked up by boto3's standard chain (AWS_ACCESS_KEY_ID /
 AWS_SECRET_ACCESS_KEY env vars, or an EC2 instance role) - never handled
-directly in this module. Unlike Bedrock's Claude, Textract is a native
-AWS service, not a third-party model - no AWS Marketplace subscription
+directly in this module. Textract is a native AWS service, not a
+third-party model on Bedrock - no AWS Marketplace subscription
 involved, so it isn't subject to the INVALID_PAYMENT_INSTRUMENT failure
 seen there.
 """
