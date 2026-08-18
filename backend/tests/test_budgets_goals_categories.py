@@ -1,5 +1,6 @@
 """Integration tests for categories CRUD, budgets, goals, and the enriched analytics summary."""
 import io
+from datetime import datetime
 
 
 SAMPLE_CSV = (
@@ -7,6 +8,15 @@ SAMPLE_CSV = (
     b'2024-01-15,Grocery Shopping BigBasket,1500\n'
     b'2024-01-16,Electricity Bill,2000\n'
 )
+
+# Budget spend is always computed for the current calendar month (see
+# main.py's _current_month_range()), so the sweep/alert tests below need a
+# transaction dated this month rather than SAMPLE_CSV's fixed 2024 date.
+_THIS_MONTH = datetime.utcnow().date().strftime('%Y-%m-01')
+
+
+def _current_month_csv(description, amount):
+    return f'Date,Description,Amount\n{_THIS_MONTH},{description},{amount}\n'.encode()
 
 
 def _get_category_id(client, headers, name):
@@ -219,3 +229,106 @@ class TestAnalyticsIncomeSpendingSplit:
         response = client.get('/api/analytics/summary?period=current_month', headers=auth_headers)
         assert 'change' in response.get_json()['data']
         assert set(response.get_json()['data']['change'].keys()) == {'spending', 'income', 'transactions'}
+
+
+class TestBudgetAlerts:
+    def test_no_alert_below_80_percent(self, client, auth_headers):
+        groceries_id = _get_category_id(client, auth_headers, 'Groceries')
+        client.post('/api/budgets', json={'category_id': groceries_id, 'monthly_limit': 5000}, headers=auth_headers)
+
+        budget = client.get('/api/budgets', headers=auth_headers).get_json()['data'][0]
+        assert budget['alert_level'] == 'ok'
+        assert budget['alert_message'] is None
+
+    def test_warning_alert_at_80_percent_or_more(self, client, auth_headers):
+        groceries_id = _get_category_id(client, auth_headers, 'Groceries')
+        client.post('/api/budgets', json={'category_id': groceries_id, 'monthly_limit': 1800}, headers=auth_headers)
+        client.post('/api/uploads', data={'file': (io.BytesIO(_current_month_csv('Grocery Shopping BigBasket', 1500)), 'statement.csv')}, headers=auth_headers, content_type='multipart/form-data')
+
+        budget = client.get('/api/budgets', headers=auth_headers).get_json()['data'][0]
+        assert budget['percent_used'] > 80
+        assert budget['alert_level'] == 'warning'
+        assert 'left in the month' in budget['alert_message']
+
+    def test_over_alert_when_limit_exceeded(self, client, auth_headers):
+        groceries_id = _get_category_id(client, auth_headers, 'Groceries')
+        client.post('/api/budgets', json={'category_id': groceries_id, 'monthly_limit': 1000}, headers=auth_headers)
+        client.post('/api/uploads', data={'file': (io.BytesIO(_current_month_csv('Grocery Shopping BigBasket', 1500)), 'statement.csv')}, headers=auth_headers, content_type='multipart/form-data')
+
+        budget = client.get('/api/budgets', headers=auth_headers).get_json()['data'][0]
+        assert budget['alert_level'] == 'over'
+        assert 'gone' in budget['alert_message'] and 'over your' in budget['alert_message']
+
+
+class TestBudgetSweep:
+    def _make_budget_with_surplus(self, client, auth_headers, limit=5000, spend=1500):
+        groceries_id = _get_category_id(client, auth_headers, 'Groceries')
+        client.post('/api/budgets', json={'category_id': groceries_id, 'monthly_limit': limit}, headers=auth_headers)
+        client.post('/api/uploads', data={'file': (io.BytesIO(_current_month_csv('Grocery Shopping BigBasket', spend)), 'statement.csv')}, headers=auth_headers, content_type='multipart/form-data')
+        return client.get('/api/budgets', headers=auth_headers).get_json()['data'][0]
+
+    def test_available_to_sweep_reflects_unspent_amount(self, client, auth_headers):
+        budget = self._make_budget_with_surplus(client, auth_headers, limit=5000, spend=1500)
+        assert budget['available_to_sweep'] == 3500.0
+        assert budget['already_swept'] == 0.0
+
+    def test_sweep_moves_amount_into_goal_and_tracks_it(self, client, auth_headers):
+        budget = self._make_budget_with_surplus(client, auth_headers, limit=5000, spend=1500)
+        goal = client.post('/api/goals', json={'name': 'Vacation', 'target_amount': 10000}, headers=auth_headers).get_json()['data']
+
+        response = client.post(f"/api/budgets/{budget['id']}/sweep", json={'goal_id': goal['id'], 'amount': 2000}, headers=auth_headers)
+        assert response.status_code == 201
+        body = response.get_json()['data']
+        assert body['goal']['current_amount'] == 2000.0
+        assert body['budget']['already_swept'] == 2000.0
+        assert body['budget']['available_to_sweep'] == 1500.0  # 3500 surplus - 2000 already swept
+
+        # A goal contribution made this way should show up like any other.
+        goal_after = client.get('/api/goals', headers=auth_headers).get_json()['data'][0]
+        assert goal_after['current_amount'] == 2000.0
+
+    def test_cannot_sweep_more_than_available(self, client, auth_headers):
+        budget = self._make_budget_with_surplus(client, auth_headers, limit=5000, spend=1500)
+        goal = client.post('/api/goals', json={'name': 'Vacation', 'target_amount': 10000}, headers=auth_headers).get_json()['data']
+
+        response = client.post(f"/api/budgets/{budget['id']}/sweep", json={'goal_id': goal['id'], 'amount': 4000}, headers=auth_headers)
+        assert response.status_code == 400
+        assert goal['current_amount'] == 0.0  # rejected before touching the goal
+
+    def test_second_sweep_respects_amount_already_swept_this_month(self, client, auth_headers):
+        budget = self._make_budget_with_surplus(client, auth_headers, limit=5000, spend=1500)
+        goal = client.post('/api/goals', json={'name': 'Vacation', 'target_amount': 10000}, headers=auth_headers).get_json()['data']
+
+        client.post(f"/api/budgets/{budget['id']}/sweep", json={'goal_id': goal['id'], 'amount': 3000}, headers=auth_headers)
+        # Only 500 of the 3500 surplus is left - sweeping 1000 more should fail.
+        response = client.post(f"/api/budgets/{budget['id']}/sweep", json={'goal_id': goal['id'], 'amount': 1000}, headers=auth_headers)
+        assert response.status_code == 400
+
+        goal_after = client.get('/api/goals', headers=auth_headers).get_json()['data'][0]
+        assert goal_after['current_amount'] == 3000.0  # unchanged by the rejected sweep
+
+    def test_sweep_requires_goal_id(self, client, auth_headers):
+        budget = self._make_budget_with_surplus(client, auth_headers)
+        response = client.post(f"/api/budgets/{budget['id']}/sweep", json={'amount': 100}, headers=auth_headers)
+        assert response.status_code == 400
+
+    def test_cannot_sweep_into_another_users_goal(self, client, auth_headers):
+        budget = self._make_budget_with_surplus(client, auth_headers)
+
+        client.post('/api/auth/signup', json={'username': 'other5', 'email': 'other5@example.com', 'password': 'Passw0rd!'})
+        token_b = client.post('/api/auth/login', json={'email': 'other5@example.com', 'password': 'Passw0rd!'}).get_json()['data']['access_token']
+        other_goal = client.post('/api/goals', json={'name': 'Their Goal', 'target_amount': 5000}, headers={'Authorization': f'Bearer {token_b}'}).get_json()['data']
+
+        response = client.post(f"/api/budgets/{budget['id']}/sweep", json={'goal_id': other_goal['id'], 'amount': 100}, headers=auth_headers)
+        assert response.status_code == 404
+
+    def test_cannot_sweep_someone_elses_budget(self, client, auth_headers):
+        budget = self._make_budget_with_surplus(client, auth_headers)
+
+        client.post('/api/auth/signup', json={'username': 'other6', 'email': 'other6@example.com', 'password': 'Passw0rd!'})
+        token_b = client.post('/api/auth/login', json={'email': 'other6@example.com', 'password': 'Passw0rd!'}).get_json()['data']['access_token']
+        headers_b = {'Authorization': f'Bearer {token_b}'}
+        goal_b = client.post('/api/goals', json={'name': 'My Goal', 'target_amount': 5000}, headers=headers_b).get_json()['data']
+
+        response = client.post(f"/api/budgets/{budget['id']}/sweep", json={'goal_id': goal_b['id'], 'amount': 100}, headers=headers_b)
+        assert response.status_code == 404

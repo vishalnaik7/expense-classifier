@@ -15,6 +15,7 @@ import uuid
 import io
 import re
 import statistics
+import calendar
 import csv as csv_module
 from collections import defaultdict
 from sqlalchemy.exc import IntegrityError
@@ -233,15 +234,57 @@ class Budget(db.Model):
         db.UniqueConstraint('user_id', 'category_id', name='uq_user_category_budget'),
     )
 
-    def to_dict(self, spent=0.0):
+    def to_dict(self, spent=0.0, already_swept=0.0):
         limit = float(self.monthly_limit)
+        percent_used = round((spent / limit) * 100, 1) if limit > 0 else 0
+        category_name = self.category.name if self.category else 'this'
+
+        alert_level = 'ok'
+        alert_message = None
+        if limit > 0 and spent > limit:
+            alert_message = f'You have gone ₹{spent - limit:,.2f} over your {category_name} budget this month.'
+            alert_level = 'over'
+        elif limit > 0 and percent_used >= 80:
+            today = datetime.utcnow().date()
+            days_left = calendar.monthrange(today.year, today.month)[1] - today.day
+            days_text = f'{days_left} day{"s" if days_left != 1 else ""} left' if days_left > 0 else 'the last day'
+            alert_message = f'You have used {percent_used}% of your {category_name} budget with {days_text} in the month.'
+            alert_level = 'warning'
+
         return {
             'id': self.id,
             'category': self.category.to_dict() if self.category else None,
             'monthly_limit': limit,
             'spent': round(spent, 2),
             'remaining': round(limit - spent, 2),
-            'percent_used': round((spent / limit) * 100, 1) if limit > 0 else 0,
+            'percent_used': percent_used,
+            'alert_level': alert_level,
+            'alert_message': alert_message,
+            'already_swept': round(already_swept, 2),
+            'available_to_sweep': round(max(limit - spent - already_swept, 0), 2),
+            'created_at': self.created_at.isoformat() if self.created_at else None
+        }
+
+
+class BudgetSweep(db.Model):
+    """A transfer of a budget's unspent amount for one month into a savings goal"""
+    __tablename__ = 'budget_sweeps'
+
+    id = db.Column(db.String(36), primary_key=True)
+    user_id = db.Column(db.String(36), db.ForeignKey('users.id'), nullable=False, index=True)
+    budget_id = db.Column(db.String(36), db.ForeignKey('budgets.id'), nullable=False, index=True)
+    goal_id = db.Column(db.String(36), db.ForeignKey('goals.id'), nullable=False, index=True)
+    amount = db.Column(db.Numeric(10, 2), nullable=False)
+    month = db.Column(db.Date, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'budget_id': self.budget_id,
+            'goal_id': self.goal_id,
+            'amount': round(float(self.amount), 2),
+            'month': self.month.isoformat() if self.month else None,
             'created_at': self.created_at.isoformat() if self.created_at else None
         }
 
@@ -1152,6 +1195,27 @@ def _current_month_range():
     return today.replace(day=1), today
 
 
+def _current_month_spend(user_id, category_id, start_date, end_date):
+    return float(
+        db.session.query(db.func.sum(Transaction.amount))
+        .filter(
+            Transaction.user_id == user_id,
+            Transaction.category_id == category_id,
+            Transaction.transaction_type == 'debit',
+            Transaction.transaction_date >= start_date,
+            Transaction.transaction_date <= end_date
+        ).scalar() or 0
+    )
+
+
+def _swept_this_month(budget_id, month_start):
+    return float(
+        db.session.query(db.func.sum(BudgetSweep.amount))
+        .filter(BudgetSweep.budget_id == budget_id, BudgetSweep.month == month_start)
+        .scalar() or 0
+    )
+
+
 @app.route('/api/budgets', methods=['GET'])
 @jwt_required()
 def get_budgets():
@@ -1173,9 +1237,18 @@ def get_budgets():
             .group_by(Transaction.category_id)
             .all()
         )
+        swept_by_budget = dict(
+            db.session.query(BudgetSweep.budget_id, db.func.sum(BudgetSweep.amount))
+            .filter(BudgetSweep.user_id == user_id, BudgetSweep.month == start_date)
+            .group_by(BudgetSweep.budget_id)
+            .all()
+        )
 
         data = [
-            b.to_dict(spent=float(spend_by_category.get(b.category_id, 0)))
+            b.to_dict(
+                spent=float(spend_by_category.get(b.category_id, 0)),
+                already_swept=float(swept_by_budget.get(b.id, 0))
+            )
             for b in budgets
         ]
         return jsonify({'success': True, 'data': data}), 200
@@ -1266,6 +1339,65 @@ def delete_budget(budget_id):
         db.session.delete(budget)
         db.session.commit()
         return jsonify({'success': True, 'message': 'Budget deleted'}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/budgets/<budget_id>/sweep', methods=['POST'])
+@jwt_required()
+def sweep_budget_surplus(budget_id):
+    """Move some or all of a budget's unspent amount this month into a savings goal"""
+    try:
+        user_id = get_jwt_identity()
+        budget = Budget.query.get(budget_id)
+        if not budget or budget.user_id != user_id:
+            return jsonify({'success': False, 'error': 'Budget not found'}), 404
+
+        data = request.get_json() or {}
+        goal_id = data.get('goal_id')
+        if not goal_id:
+            return jsonify({'success': False, 'error': 'goal_id is required'}), 400
+
+        goal = Goal.query.get(goal_id)
+        if not goal or goal.user_id != user_id:
+            return jsonify({'success': False, 'error': 'Goal not found'}), 404
+
+        try:
+            amount = float(data.get('amount'))
+            if amount <= 0:
+                raise ValueError()
+        except (TypeError, ValueError):
+            return jsonify({'success': False, 'error': 'amount must be a positive number'}), 400
+
+        start_date, end_date = _current_month_range()
+        spent = _current_month_spend(user_id, budget.category_id, start_date, end_date)
+        already_swept = _swept_this_month(budget.id, start_date)
+        available = max(float(budget.monthly_limit) - spent - already_swept, 0)
+
+        if amount > available + 0.01:
+            return jsonify({
+                'success': False,
+                'error': f'Only ₹{available:,.2f} is available to sweep from this budget this month'
+            }), 400
+
+        sweep = BudgetSweep(
+            id=str(uuid.uuid4()), user_id=user_id, budget_id=budget.id,
+            goal_id=goal.id, amount=amount, month=start_date
+        )
+        db.session.add(sweep)
+        goal.current_amount = float(goal.current_amount) + amount
+        db.session.commit()
+
+        return jsonify({
+            'success': True,
+            'message': f'Moved ₹{amount:,.2f} into {goal.name}',
+            'data': {
+                'sweep': sweep.to_dict(),
+                'goal': goal.to_dict(),
+                'budget': budget.to_dict(spent=spent, already_swept=already_swept + amount)
+            }
+        }), 201
     except Exception as e:
         db.session.rollback()
         return jsonify({'success': False, 'error': str(e)}), 500

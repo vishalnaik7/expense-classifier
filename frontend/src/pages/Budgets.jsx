@@ -1,5 +1,6 @@
 import React, { useEffect, useState, useCallback } from 'react';
-import { budgetsAPI, expenseAPI } from '../utils/api';
+import { Link } from 'react-router-dom';
+import { budgetsAPI, expenseAPI, goalsAPI } from '../utils/api';
 import Layout from '../components/Layout';
 
 const formatCurrency = (amount) =>
@@ -8,6 +9,7 @@ const formatCurrency = (amount) =>
 const BudgetsPage = () => {
   const [budgets, setBudgets] = useState([]);
   const [categories, setCategories] = useState([]);
+  const [goals, setGoals] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
@@ -16,15 +18,22 @@ const BudgetsPage = () => {
   const [limit, setLimit] = useState('');
   const [submitting, setSubmitting] = useState(false);
 
+  const [sweepingBudgetId, setSweepingBudgetId] = useState(null);
+  const [sweepGoalId, setSweepGoalId] = useState('');
+  const [sweepAmount, setSweepAmount] = useState('');
+  const [sweeping, setSweeping] = useState(false);
+
   const fetchAll = useCallback(async () => {
     try {
       setLoading(true);
-      const [budgetsRes, categoriesRes] = await Promise.all([
+      const [budgetsRes, categoriesRes, goalsRes] = await Promise.all([
         budgetsAPI.getBudgets(),
         expenseAPI.getCategories(),
+        goalsAPI.getGoals(),
       ]);
       setBudgets(budgetsRes.data.data || []);
       setCategories(categoriesRes.data.data || []);
+      setGoals(goalsRes.data.data || []);
     } catch (err) {
       setError('Failed to load budgets');
     } finally {
@@ -74,6 +83,35 @@ const BudgetsPage = () => {
       fetchAll();
     } catch (err) {
       setError('Failed to delete budget');
+    }
+  };
+
+  const openSweepForm = (budget) => {
+    setSweepingBudgetId(budget.id);
+    setSweepGoalId(goals[0]?.id || '');
+    setSweepAmount(String(budget.available_to_sweep));
+    setError(null);
+  };
+
+  const closeSweepForm = () => {
+    setSweepingBudgetId(null);
+    setSweepGoalId('');
+    setSweepAmount('');
+  };
+
+  const handleSweep = async (e, budgetId) => {
+    e.preventDefault();
+    if (!sweepGoalId || !sweepAmount) return;
+    setSweeping(true);
+    setError(null);
+    try {
+      await budgetsAPI.sweepToGoal(budgetId, sweepGoalId, parseFloat(sweepAmount));
+      closeSweepForm();
+      fetchAll();
+    } catch (err) {
+      setError(err.response?.data?.error || 'Failed to move money into that goal');
+    } finally {
+      setSweeping(false);
     }
   };
 
@@ -184,7 +222,7 @@ const BudgetsPage = () => {
                   style={{ width: `${Math.min(b.percent_used, 100)}%` }}
                 />
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 mb-3">
                 <span className="text-xs text-gray-400">Limit:</span>
                 <input
                   type="number" min="1" step="0.01"
@@ -192,10 +230,60 @@ const BudgetsPage = () => {
                   onBlur={(e) => e.target.value !== String(b.monthly_limit) && handleUpdate(b.id, e.target.value)}
                   className="w-24 border border-gray-200 rounded-lg px-2 py-1 text-xs"
                 />
-                {b.percent_used >= 100 && (
-                  <span className="text-xs font-semibold text-red-600 ml-auto">Over budget</span>
-                )}
               </div>
+
+              {b.alert_message && (
+                <p className={`text-xs rounded-lg px-3 py-2 mb-3 ${b.alert_level === 'over' ? 'bg-red-50 text-red-700' : 'bg-amber-50 text-amber-700'}`}>
+                  {b.alert_level === 'over' ? '⚠️ ' : '⏳ '}{b.alert_message}
+                </p>
+              )}
+
+              {b.available_to_sweep > 0 && goals.length > 0 && (
+                sweepingBudgetId === b.id ? (
+                  <form onSubmit={(e) => handleSweep(e, b.id)} className="bg-indigo-50 rounded-lg p-3 space-y-2">
+                    <p className="text-xs text-indigo-700 font-medium">Move unspent money into a goal</p>
+                    <select
+                      value={sweepGoalId}
+                      onChange={(e) => setSweepGoalId(e.target.value)}
+                      className="w-full border border-indigo-200 rounded-lg px-2 py-1.5 text-xs bg-white"
+                      required
+                    >
+                      {goals.map((g) => (
+                        <option key={g.id} value={g.id}>{g.icon} {g.name}</option>
+                      ))}
+                    </select>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="number" min="0.01" max={b.available_to_sweep} step="0.01"
+                        value={sweepAmount}
+                        onChange={(e) => setSweepAmount(e.target.value)}
+                        className="flex-1 border border-indigo-200 rounded-lg px-2 py-1.5 text-xs bg-white"
+                        required
+                      />
+                      <button type="submit" disabled={sweeping} className="bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white font-semibold py-1.5 px-3 rounded-lg text-xs shrink-0">
+                        {sweeping ? 'Moving...' : 'Move'}
+                      </button>
+                      <button type="button" onClick={closeSweepForm} className="text-gray-400 hover:text-gray-600 text-xs font-semibold shrink-0">
+                        Cancel
+                      </button>
+                    </div>
+                    <p className="text-xs text-indigo-400">Up to {formatCurrency(b.available_to_sweep)} unspent this month</p>
+                  </form>
+                ) : (
+                  <button
+                    onClick={() => openSweepForm(b)}
+                    className="w-full text-xs font-semibold text-indigo-600 hover:text-indigo-800 bg-indigo-50 hover:bg-indigo-100 rounded-lg py-2 transition"
+                  >
+                    ✨ {formatCurrency(b.available_to_sweep)} unspent — move to a goal
+                  </button>
+                )
+              )}
+              {b.available_to_sweep > 0 && goals.length === 0 && (
+                <p className="text-xs text-gray-400 text-center bg-gray-50 rounded-lg py-2">
+                  {formatCurrency(b.available_to_sweep)} unspent this month.{' '}
+                  <Link to="/goals" className="text-indigo-600 font-semibold hover:text-indigo-800">Set a savings goal</Link> to move it there.
+                </p>
+              )}
             </div>
           ))}
         </div>

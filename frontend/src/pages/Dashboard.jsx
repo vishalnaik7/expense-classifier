@@ -88,6 +88,8 @@ const Dashboard = () => {
   const incomeSparkline = analytics.monthlyTrends.map((m) => ({ value: m.income }));
   const savingsSparkline = analytics.monthlyTrends.map((m) => ({ value: m.income - m.spending }));
 
+  const budgetAlerts = budgets.filter((b) => b.alert_level && b.alert_level !== 'ok');
+
   const overallBudget = budgets.reduce((acc, b) => ({
     spent: acc.spent + b.spent,
     limit: acc.limit + b.monthly_limit,
@@ -155,6 +157,24 @@ const Dashboard = () => {
         <div className="bg-red-50 border border-red-300 text-red-700 rounded-xl p-4 mb-6 flex justify-between items-center">
           <span className="text-sm">{error}</span>
           <button onClick={fetchAll} className="font-semibold underline text-sm shrink-0">Retry</button>
+        </div>
+      )}
+
+      {/* Budget alerts */}
+      {budgetAlerts.length > 0 && (
+        <div className="space-y-2 mb-6">
+          {budgetAlerts.map((b) => (
+            <div
+              key={b.id}
+              className={`rounded-xl p-3.5 flex items-center gap-3 text-sm ${
+                b.alert_level === 'over' ? 'bg-red-50 text-red-700 border border-red-200' : 'bg-amber-50 text-amber-700 border border-amber-200'
+              }`}
+            >
+              <span className="text-base shrink-0">{b.alert_level === 'over' ? '⚠️' : '⏳'}</span>
+              <span className="flex-1">{b.alert_message}</span>
+              <Link to="/budgets" className="font-semibold underline shrink-0">View</Link>
+            </div>
+          ))}
         </div>
       )}
 

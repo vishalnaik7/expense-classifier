@@ -73,6 +73,7 @@ export const budgetsAPI = {
   setBudget: (categoryId, monthlyLimit) => apiClient.post('/budgets', { category_id: categoryId, monthly_limit: monthlyLimit }),
   updateBudget: (id, monthlyLimit) => apiClient.put(`/budgets/${id}`, { monthly_limit: monthlyLimit }),
   deleteBudget: (id) => apiClient.delete(`/budgets/${id}`),
+  sweepToGoal: (id, goalId, amount) => apiClient.post(`/budgets/${id}/sweep`, { goal_id: goalId, amount }),
 };
 
 export const goalsAPI = {
