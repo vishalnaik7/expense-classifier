@@ -150,7 +150,7 @@ def test_pdf_with_no_extractable_text_goes_straight_to_vision_fallback(client, a
     # nothing for a text-based AI fallback to read - the endpoint should
     # skip straight to vision-based extraction rather than making a
     # doomed text-based attempt first.
-    monkeypatch.setattr(main_module.bedrock_vision, 'is_configured', lambda: True)
+    monkeypatch.setattr(main_module.textract_extractor, 'is_configured', lambda: True)
     image_only_pdf = _build_image_only_pdf(['Date Narration Withdrawal Deposit', '05/05/26 ACH D 11611.00'])
 
     fake_transactions = [{
@@ -162,7 +162,7 @@ def test_pdf_with_no_extractable_text_goes_straight_to_vision_fallback(client, a
         'raw_amount': 11611.0,
     }]
 
-    with patch.object(main_module.bedrock_vision, 'extract_transactions_from_images', return_value=(fake_transactions, False)) as mock_vision, \
+    with patch.object(main_module.textract_extractor, 'extract_transactions_from_images', return_value=fake_transactions) as mock_vision, \
             patch.object(main_module.llm_extractor, 'extract_transactions') as mock_text:
         response = _upload(client, auth_headers, content=image_only_pdf, filename='hdfc_no_text.pdf')
 
@@ -182,7 +182,7 @@ def test_pdf_vision_fallback_used_when_text_fallback_also_fails(client, auth_hea
     # still can't find a transaction table, should still get a vision
     # attempt as a last resort before giving up entirely.
     monkeypatch.setattr(main_module.llm_extractor, 'is_configured', lambda: True)
-    monkeypatch.setattr(main_module.bedrock_vision, 'is_configured', lambda: True)
+    monkeypatch.setattr(main_module.textract_extractor, 'is_configured', lambda: True)
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=letter)
     doc.build([Table([['Foo', 'Bar'], ['1', '2']], style=_GRID_STYLE)])
@@ -197,7 +197,7 @@ def test_pdf_vision_fallback_used_when_text_fallback_also_fails(client, auth_hea
     }]
 
     with patch.object(main_module.llm_extractor, 'extract_transactions', side_effect=main_module.LLMExtractionError('AI could not find a transaction table in this file')), \
-            patch.object(main_module.bedrock_vision, 'extract_transactions_from_images', return_value=(fake_transactions, False)) as mock_vision:
+            patch.object(main_module.textract_extractor, 'extract_transactions_from_images', return_value=fake_transactions) as mock_vision:
         response = _upload(client, auth_headers, content=buffer.getvalue(), filename='unreadable.pdf')
 
     assert response.status_code == 201
@@ -207,10 +207,11 @@ def test_pdf_vision_fallback_used_when_text_fallback_also_fails(client, auth_hea
 
 
 def test_upload_warns_when_nova_lite_fallback_model_was_used(client, auth_headers, monkeypatch):
-    # When bedrock_vision reports it had to fall back to Nova Lite
-    # (Claude failed), the upload should surface that as a lower-
-    # confidence warning rather than treating it like an ordinary
+    # When Textract can't find a table and it falls all the way through
+    # to Bedrock's Nova Lite, the upload should surface that as a
+    # lower-confidence warning rather than treating it like an ordinary
     # AI-assisted parse.
+    monkeypatch.setattr(main_module.textract_extractor, 'is_configured', lambda: False)
     monkeypatch.setattr(main_module.bedrock_vision, 'is_configured', lambda: True)
     image_only_pdf = _build_image_only_pdf(['Date Narration Withdrawal Deposit', '05/05/26 ACH D 11611.00'])
 
@@ -223,14 +224,14 @@ def test_upload_warns_when_nova_lite_fallback_model_was_used(client, auth_header
         'raw_amount': 11611.0,
     }]
 
-    with patch.object(main_module.bedrock_vision, 'extract_transactions_from_images', return_value=(fake_transactions, True)):
+    with patch.object(main_module.bedrock_vision, 'extract_transactions_from_images', return_value=fake_transactions):
         response = _upload(client, auth_headers, content=image_only_pdf, filename='hdfc_no_text.pdf')
 
     assert response.status_code == 201
     body = response.get_json()
     assert body['data']['used_ai_fallback'] is True
     assert body['data']['used_fallback_model'] is True
-    assert 'Nova Lite' in body['data']['upload']['error_message']
+    assert 'lower-confidence' in body['data']['upload']['error_message']
     assert 'double-check' in body['data']['upload']['error_message']
 
 
@@ -238,32 +239,50 @@ class TestVisionFallbackChain:
     """
     Unit tests for _vision_extract_with_fallbacks() and
     vision_extraction_available() directly - the chain that tries AWS
-    Bedrock (Claude, then Nova Lite) first, then Gemini and Mistral via
-    ai_client, used by both branches of _ai_fallback_parse().
+    Textract first (trusted, OCR-based), then falls through to the
+    lower-confidence generative-AI tiers (Bedrock's Nova Lite, then
+    Gemini and Mistral via ai_client) only if Textract fails, used by
+    both branches of _ai_fallback_parse().
     """
 
-    def test_uses_bedrock_result_when_it_succeeds(self, monkeypatch):
-        with patch.object(main_module.bedrock_vision, 'extract_transactions_from_images', return_value=([{'d': 1}], False)) as mock_bedrock, \
+    def test_uses_textract_result_when_it_succeeds(self, monkeypatch):
+        with patch.object(main_module.textract_extractor, 'extract_transactions_from_images', return_value=[{'d': 1}]) as mock_textract, \
+                patch.object(main_module.bedrock_vision, 'extract_transactions_from_images') as mock_bedrock, \
                 patch.object(main_module.llm_extractor, 'extract_transactions_from_images') as mock_llm_extractor:
             transactions, used_fallback_model = main_module._vision_extract_with_fallbacks([b'page'])
 
         assert transactions == [{'d': 1}]
         assert used_fallback_model is False
-        mock_bedrock.assert_called_once()
+        mock_textract.assert_called_once()
+        mock_bedrock.assert_not_called()
         mock_llm_extractor.assert_not_called()
 
-    def test_prefers_bigger_result_when_bedrocks_own_fallback_weakly_succeeds(self, monkeypatch):
-        # The scenario this heuristic exists for: bedrock_vision doesn't
-        # raise at all (Nova Lite returned something), but a later
-        # provider's result is far more complete - the naive "stop at
-        # first success" chain would have silently kept the worse one.
+    def test_falls_back_to_bedrock_when_textract_fails(self, monkeypatch):
+        monkeypatch.setattr(main_module.bedrock_vision, 'is_configured', lambda: True)
+        monkeypatch.setattr(main_module.ai_client, 'is_configured_for', lambda provider: False)
+
+        with patch.object(main_module.textract_extractor, 'extract_transactions_from_images', side_effect=main_module.PDFParsingError('no table found')), \
+                patch.object(main_module.bedrock_vision, 'extract_transactions_from_images', return_value=[{'d': 1}]) as mock_bedrock:
+            transactions, used_fallback_model = main_module._vision_extract_with_fallbacks([b'page'])
+
+        assert transactions == [{'d': 1}]
+        assert used_fallback_model is True
+        mock_bedrock.assert_called_once()
+
+    def test_prefers_bigger_result_across_lower_confidence_tiers(self, monkeypatch):
+        # Textract failing (or not being configured) means every
+        # remaining tier is already known lower-confidence, so this picks
+        # whichever of them returned the most transactions rather than
+        # just the first one that didn't raise.
+        monkeypatch.setattr(main_module.bedrock_vision, 'is_configured', lambda: True)
         monkeypatch.setattr(main_module.ai_client, 'is_configured_for', lambda provider: provider == 'mistral')
 
         def fake_extract(images, provider):
             assert provider == 'mistral'
             return [{'d': 1}, {'d': 2}, {'d': 3}]
 
-        with patch.object(main_module.bedrock_vision, 'extract_transactions_from_images', return_value=([{'d': 'nova-lite-only-one'}], True)), \
+        with patch.object(main_module.textract_extractor, 'extract_transactions_from_images', side_effect=main_module.PDFParsingError('no table found')), \
+                patch.object(main_module.bedrock_vision, 'extract_transactions_from_images', return_value=[{'d': 'nova-lite-only-one'}]), \
                 patch.object(main_module.llm_extractor, 'extract_transactions_from_images', side_effect=fake_extract):
             transactions, used_fallback_model = main_module._vision_extract_with_fallbacks([b'page'])
 
@@ -271,10 +290,12 @@ class TestVisionFallbackChain:
         assert len(transactions) == 3
         assert transactions[0]['d'] == 1
 
-    def test_falls_back_to_gemini_when_bedrock_fails(self, monkeypatch):
+    def test_falls_back_to_gemini_when_textract_and_bedrock_fail(self, monkeypatch):
+        monkeypatch.setattr(main_module.bedrock_vision, 'is_configured', lambda: True)
         monkeypatch.setattr(main_module.ai_client, 'is_configured_for', lambda provider: provider == 'gemini')
 
-        with patch.object(main_module.bedrock_vision, 'extract_transactions_from_images', side_effect=main_module.LLMExtractionError('bedrock down')), \
+        with patch.object(main_module.textract_extractor, 'extract_transactions_from_images', side_effect=main_module.PDFParsingError('no table found')), \
+                patch.object(main_module.bedrock_vision, 'extract_transactions_from_images', side_effect=main_module.LLMExtractionError('bedrock down')), \
                 patch.object(main_module.llm_extractor, 'extract_transactions_from_images', return_value=[{'d': 1}]) as mock_llm_extractor:
             transactions, used_fallback_model = main_module._vision_extract_with_fallbacks([b'page'])
 
@@ -282,48 +303,40 @@ class TestVisionFallbackChain:
         assert used_fallback_model is True
         mock_llm_extractor.assert_called_once_with([b'page'], provider='gemini')
 
-    def test_falls_back_to_mistral_when_bedrock_and_gemini_fail(self, monkeypatch):
-        monkeypatch.setattr(main_module.ai_client, 'is_configured_for', lambda provider: provider in ('gemini', 'mistral'))
-
-        def fake_extract(images, provider):
-            if provider == 'gemini':
-                raise main_module.LLMExtractionError('gemini down')
-            return [{'d': 'from mistral'}]
-
-        with patch.object(main_module.bedrock_vision, 'extract_transactions_from_images', side_effect=main_module.LLMExtractionError('bedrock down')), \
-                patch.object(main_module.llm_extractor, 'extract_transactions_from_images', side_effect=fake_extract):
-            transactions, used_fallback_model = main_module._vision_extract_with_fallbacks([b'page'])
-
-        assert transactions == [{'d': 'from mistral'}]
-        assert used_fallback_model is True
-
-    def test_skips_unconfigured_fallback_providers(self, monkeypatch):
+    def test_skips_unconfigured_bedrock_and_fallback_providers(self, monkeypatch):
+        monkeypatch.setattr(main_module.bedrock_vision, 'is_configured', lambda: False)
         monkeypatch.setattr(main_module.ai_client, 'is_configured_for', lambda provider: False)
 
-        with patch.object(main_module.bedrock_vision, 'extract_transactions_from_images', side_effect=main_module.LLMExtractionError('bedrock down')), \
+        with patch.object(main_module.textract_extractor, 'extract_transactions_from_images', side_effect=main_module.PDFParsingError('textract down')), \
+                patch.object(main_module.bedrock_vision, 'extract_transactions_from_images') as mock_bedrock, \
                 patch.object(main_module.llm_extractor, 'extract_transactions_from_images') as mock_llm_extractor:
-            with pytest.raises(main_module.LLMExtractionError, match='bedrock down'):
+            with pytest.raises(main_module.PDFParsingError, match='textract down'):
                 main_module._vision_extract_with_fallbacks([b'page'])
 
+        mock_bedrock.assert_not_called()
         mock_llm_extractor.assert_not_called()
 
     def test_raises_last_error_when_every_tier_fails(self, monkeypatch):
+        monkeypatch.setattr(main_module.bedrock_vision, 'is_configured', lambda: True)
         monkeypatch.setattr(main_module.ai_client, 'is_configured_for', lambda provider: True)
 
         def fake_extract(images, provider):
             raise main_module.LLMExtractionError(f'{provider} failed')
 
-        with patch.object(main_module.bedrock_vision, 'extract_transactions_from_images', side_effect=main_module.LLMExtractionError('bedrock failed')), \
+        with patch.object(main_module.textract_extractor, 'extract_transactions_from_images', side_effect=main_module.PDFParsingError('textract failed')), \
+                patch.object(main_module.bedrock_vision, 'extract_transactions_from_images', side_effect=main_module.LLMExtractionError('bedrock failed')), \
                 patch.object(main_module.llm_extractor, 'extract_transactions_from_images', side_effect=fake_extract):
             with pytest.raises(main_module.LLMExtractionError, match='mistral failed'):
                 main_module._vision_extract_with_fallbacks([b'page'])
 
     def test_vision_extraction_available_true_when_any_tier_configured(self, monkeypatch):
+        monkeypatch.setattr(main_module.textract_extractor, 'is_configured', lambda: False)
         monkeypatch.setattr(main_module.bedrock_vision, 'is_configured', lambda: False)
         monkeypatch.setattr(main_module.ai_client, 'is_configured_for', lambda provider: provider == 'mistral')
         assert main_module.vision_extraction_available() is True
 
     def test_vision_extraction_available_false_when_nothing_configured(self, monkeypatch):
+        monkeypatch.setattr(main_module.textract_extractor, 'is_configured', lambda: False)
         monkeypatch.setattr(main_module.bedrock_vision, 'is_configured', lambda: False)
         monkeypatch.setattr(main_module.ai_client, 'is_configured_for', lambda provider: False)
         assert main_module.vision_extraction_available() is False

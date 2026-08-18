@@ -35,8 +35,12 @@ visually. This is functionally identical to a scanned image for
 data-extraction purposes (even though there's no single large embedded
 raster image to point at - it's the whole vector page that has no text
 layer), so it needs vision-based extraction: render each page to a PNG
-and let a vision-capable model (services/llm_extractor.py's
-extract_transactions_from_images()) read it directly.
+and let main.py's _vision_extract_with_fallbacks() read it directly -
+AWS Textract's OCR-based table detection first (services/
+textract_extractor.py, reusing looks_like_header_row()/
+rows_to_csv_text() below the same way this module does), then
+generative vision models as a lower-confidence fallback (services/
+bedrock_vision.py, services/ai_client.py's Gemini/Mistral).
 """
 import csv
 import io
@@ -52,7 +56,7 @@ class PDFParsingError(Exception):
     pass
 
 
-def _looks_like_header_row(row: List[Optional[str]]) -> bool:
+def looks_like_header_row(row: List[Optional[str]]) -> bool:
     """
     Does this extracted table row look like the transaction table's header
     (not the small Opening/Total Debit/Total Credit/Closing Balance summary
@@ -81,7 +85,7 @@ def _looks_like_header_row(row: List[Optional[str]]) -> bool:
     return has_date and has_amount and has_description
 
 
-def _rows_to_csv_text(header: List[str], rows: List[List[Optional[str]]]) -> str:
+def rows_to_csv_text(header: List[str], rows: List[List[Optional[str]]]) -> str:
     buffer = io.StringIO()
     writer = csv.writer(buffer)
     writer.writerow(header)
@@ -116,7 +120,7 @@ def extract_transaction_csv(file_content: bytes) -> str:
                     for row in table:
                         if not row or all(not str(cell or '').strip() for cell in row):
                             continue
-                        if _looks_like_header_row(row):
+                        if looks_like_header_row(row):
                             if header is None:
                                 header = [str(cell or '').strip() for cell in row]
                             continue  # a repeated header on a later page, not a data row
@@ -130,7 +134,7 @@ def extract_transaction_csv(file_content: bytes) -> str:
     if header is None or not data_rows:
         raise PDFParsingError('Could not find a transaction table in this PDF')
 
-    return _rows_to_csv_text(header, data_rows)
+    return rows_to_csv_text(header, data_rows)
 
 
 def extract_raw_text(file_content: bytes) -> str:

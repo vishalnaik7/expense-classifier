@@ -31,6 +31,7 @@ from services import chat_advisor
 from services.chat_advisor import ChatAdvisorError
 from services import ai_client
 from services import bedrock_vision
+from services import textract_extractor
 
 from reportlab.lib.pagesizes import letter
 from reportlab.lib import colors
@@ -543,60 +544,74 @@ def _get_or_create_category(name):
     return category
 
 
-# Additional vision-capable providers to try, in order, if AWS Bedrock
-# (Claude, then Nova Lite - see bedrock_vision.py) fails entirely. Both
-# are natively multimodal (see services/ai_client.py) and, unlike
-# Bedrock's Claude, aren't gated behind an AWS Marketplace subscription
-# that can fail independently of API access.
+# Lower-confidence vision-capable providers to try, in order, if
+# Textract either isn't configured or can't find a recognizable
+# transaction table. All three are generative-AI vision models that, in
+# testing, produced wrong dates, invented transactions, or swapped
+# credit/debit columns on real statements - unlike Textract's OCR-based
+# table detection, which reads what's actually on the page.
 _VISION_FALLBACK_PROVIDERS = ['gemini', 'mistral']
 
 
 def vision_extraction_available() -> bool:
-    """Whether any vision-capable path (Bedrock or the ai_client fallback providers) is usable for a PDF."""
-    return bedrock_vision.is_configured() or any(ai_client.is_configured_for(p) for p in _VISION_FALLBACK_PROVIDERS)
+    """Whether any vision-capable path (Textract, Bedrock, or the ai_client fallback providers) is usable for a PDF."""
+    return (
+        textract_extractor.is_configured()
+        or bedrock_vision.is_configured()
+        or any(ai_client.is_configured_for(p) for p in _VISION_FALLBACK_PROVIDERS)
+    )
 
 
 def _vision_extract_with_fallbacks(images):
     """
-    Tries AWS Bedrock first (Claude, then Nova Lite - see
-    bedrock_vision.py). If Claude itself succeeds, that result is
-    trusted and returned immediately. Otherwise - Bedrock failed
-    outright, or only succeeded via its own Nova Lite fallback - every
-    provider in _VISION_FALLBACK_PROVIDERS is also tried (not just the
-    first one that doesn't error), and the result with the most
-    transactions wins.
+    Tries AWS Textract first (OCR-based table detection reused through
+    the same CSVParser every other input path goes through - see
+    services/textract_extractor.py). If it finds a transaction table,
+    that result is trusted and returned immediately.
 
-    This "keep trying and pick the biggest result" approach exists
-    because a lower-confidence model failing loudly (an exception) isn't
-    the only failure mode worth working around - in testing, Nova Lite
-    returned a plausible-looking but badly incomplete/inaccurate result
-    on a real statement without raising at all, which a naive
-    first-success chain would have silently accepted over a
-    fuller/better result from a later provider. Transaction count is an
+    Otherwise - Textract isn't configured or found nothing recognizable -
+    every generative-AI vision provider (Bedrock's Nova Lite, then each
+    provider in _VISION_FALLBACK_PROVIDERS) is tried, and the result with
+    the most transactions wins, rather than stopping at the first one
+    that merely doesn't raise an exception.
+
+    This "keep trying and pick the biggest result" approach for the
+    AI-vision tier exists because a model failing loudly (an exception)
+    isn't the only failure mode worth working around - in testing, Nova
+    Lite returned a plausible-looking but badly incomplete/inaccurate
+    result on a real statement without raising at all, which a naive
+    first-success chain would have silently accepted over a fuller/
+    better result from a later provider. Transaction count is an
     imperfect proxy for accuracy, but it is what's available without a
     ground truth to check against - the used_fallback_model=True warning
     this triggers is what actually protects the user, not this
     heuristic.
 
-    Every tier after Claude is lower-confidence (see bedrock_vision's
-    docstring on Nova Lite's observed reliability gap on real
-    statements) - used_fallback_model is True for any of them, same
-    contract as bedrock_vision.extract_transactions_from_images().
+    Returns:
+        (transactions, used_fallback_model) - False only for a Textract
+        result; True for anything from the AI-vision tier, since every
+        one of those providers has shown real accuracy problems on real
+        statements and should be treated as lower-confidence.
 
     Raises:
-        LLMExtractionError: from the last tier attempted, if every
-        configured tier failed (or none were configured).
+        LLMExtractionError / PDFParsingError: from the last tier
+        attempted, if every configured tier failed (or none were
+        configured).
     """
     last_error = None
-    best_result = None
 
     try:
-        transactions, used_fallback_model = bedrock_vision.extract_transactions_from_images(images)
-        if not used_fallback_model:
-            return transactions, False
-        best_result = transactions
-    except LLMExtractionError as e:
+        return textract_extractor.extract_transactions_from_images(images), False
+    except PDFParsingError as e:
         last_error = e
+
+    best_result = None
+
+    if bedrock_vision.is_configured():
+        try:
+            best_result = bedrock_vision.extract_transactions_from_images(images)
+        except LLMExtractionError as e:
+            last_error = e
 
     for provider in _VISION_FALLBACK_PROVIDERS:
         if not ai_client.is_configured_for(provider):
@@ -629,14 +644,14 @@ def _ai_fallback_parse(extension, file_content):
     that fails - a garbled or unhelpful text layer doesn't always mean
     the rendered page itself is unreadable.
 
-    Vision extraction tries AWS Bedrock (Claude, then Nova Lite) first,
-    then Gemini and Mistral via services/ai_client.py - see
+    Vision extraction tries AWS Textract first, then AWS Bedrock's Nova
+    Lite, then Gemini and Mistral via services/ai_client.py - see
     _vision_extract_with_fallbacks() above.
 
     Returns:
         (transactions, used_fallback_model) - used_fallback_model is True
-        for any tier other than Bedrock's Claude; the caller should treat
-        that case as lower-confidence and surface a warning rather than
+        for any tier other than Textract; the caller should treat that
+        case as lower-confidence and surface a warning rather than
         trusting it silently.
 
     Raises:
@@ -707,11 +722,12 @@ def upload_csv():
         else:
             parsed_transactions = CSVParser(file_content).parse()
     except (CSVParsingError, PDFParsingError) as parse_error:
-        # A PDF can still be rescued by vision extraction (Bedrock, Gemini,
-        # or Mistral - see vision_extraction_available()) even if
-        # llm_extractor's own provider (Groq/Ollama, via AI_PROVIDER)
-        # isn't configured for text extraction - only a CSV has no vision
-        # path to fall back to, since there's no page to render.
+        # A PDF can still be rescued by vision extraction (Textract,
+        # Bedrock, Gemini, or Mistral - see vision_extraction_available())
+        # even if llm_extractor's own provider (Groq/Ollama, via
+        # AI_PROVIDER) isn't configured for text extraction - only a CSV
+        # has no vision path to fall back to, since there's no page to
+        # render.
         ai_fallback_available = llm_extractor.is_configured() or (extension == 'pdf' and vision_extraction_available())
         if not ai_fallback_available:
             upload_record.status = 'failed'
@@ -795,8 +811,8 @@ def upload_csv():
     upload_record.duplicate_count = len(in_file_duplicates) + db_duplicate_count
     if used_fallback_model:
         upload_record.error_message = (
-            'Parsed using a lower-confidence AI fallback model (Amazon Nova Lite, since Claude was '
-            'unavailable) — please double-check these transactions for accuracy.'
+            'Parsed using a lower-confidence AI vision fallback (AWS Textract could not find a '
+            'recognizable transaction table in this file) — please double-check these transactions for accuracy.'
         )
     elif used_ai_fallback:
         upload_record.error_message = (
