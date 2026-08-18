@@ -543,6 +543,50 @@ def _get_or_create_category(name):
     return category
 
 
+# Additional vision-capable providers to try, in order, if AWS Bedrock
+# (Claude, then Nova Lite - see bedrock_vision.py) fails entirely. Both
+# are natively multimodal (see services/ai_client.py) and, unlike
+# Bedrock's Claude, aren't gated behind an AWS Marketplace subscription
+# that can fail independently of API access.
+_VISION_FALLBACK_PROVIDERS = ['gemini', 'mistral']
+
+
+def vision_extraction_available() -> bool:
+    """Whether any vision-capable path (Bedrock or the ai_client fallback providers) is usable for a PDF."""
+    return bedrock_vision.is_configured() or any(ai_client.is_configured_for(p) for p in _VISION_FALLBACK_PROVIDERS)
+
+
+def _vision_extract_with_fallbacks(images):
+    """
+    Tries AWS Bedrock first (Claude, then Nova Lite - see
+    bedrock_vision.py), then each provider in _VISION_FALLBACK_PROVIDERS,
+    stopping at the first success. Every tier after Claude is
+    lower-confidence (see bedrock_vision's docstring on Nova Lite's
+    observed reliability gap on real statements) - used_fallback_model is
+    True for any of them, same contract as
+    bedrock_vision.extract_transactions_from_images().
+
+    Raises:
+        LLMExtractionError: from the last tier attempted, if every
+        configured tier failed (or none were configured).
+    """
+    last_error = None
+    try:
+        return bedrock_vision.extract_transactions_from_images(images)
+    except LLMExtractionError as e:
+        last_error = e
+
+    for provider in _VISION_FALLBACK_PROVIDERS:
+        if not ai_client.is_configured_for(provider):
+            continue
+        try:
+            return llm_extractor.extract_transactions_from_images(images, provider=provider), True
+        except LLMExtractionError as e:
+            last_error = e
+
+    raise last_error or LLMExtractionError('No vision-capable AI provider is configured')
+
+
 def _ai_fallback_parse(extension, file_content):
     """
     Attempts AI-assisted parsing after the deterministic parser fails.
@@ -557,17 +601,15 @@ def _ai_fallback_parse(extension, file_content):
     that fails - a garbled or unhelpful text layer doesn't always mean
     the rendered page itself is unreadable.
 
-    Vision extraction specifically goes through AWS Bedrock (Claude, with
-    an Amazon Nova Lite fallback), not services/ai_client.py's Ollama/
-    Groq/Gemini/Mistral abstraction used everywhere else in this file -
-    see services/bedrock_vision.py.
+    Vision extraction tries AWS Bedrock (Claude, then Nova Lite) first,
+    then Gemini and Mistral via services/ai_client.py - see
+    _vision_extract_with_fallbacks() above.
 
     Returns:
         (transactions, used_fallback_model) - used_fallback_model is True
-        only when bedrock_vision fell back to Nova Lite because Claude
-        failed; the caller should treat that case as lower-confidence
-        (see bedrock_vision.extract_transactions_from_images's docstring)
-        and surface a warning rather than trusting it silently.
+        for any tier other than Bedrock's Claude; the caller should treat
+        that case as lower-confidence and surface a warning rather than
+        trusting it silently.
 
     Raises:
         LLMExtractionError / PDFParsingError: whichever error occurred on
@@ -575,7 +617,7 @@ def _ai_fallback_parse(extension, file_content):
     """
     if extension == 'pdf' and not pdf_parser.has_extractable_text(file_content):
         images = pdf_parser.render_pages_as_images(file_content)
-        return bedrock_vision.extract_transactions_from_images(images)
+        return _vision_extract_with_fallbacks(images)
 
     try:
         ai_input = pdf_parser.extract_raw_text(file_content).encode('utf-8') if extension == 'pdf' else file_content
@@ -584,7 +626,7 @@ def _ai_fallback_parse(extension, file_content):
         if extension != 'pdf':
             raise
         images = pdf_parser.render_pages_as_images(file_content)
-        return bedrock_vision.extract_transactions_from_images(images)
+        return _vision_extract_with_fallbacks(images)
 
 
 @app.route('/api/uploads', methods=['POST'])
@@ -637,11 +679,12 @@ def upload_csv():
         else:
             parsed_transactions = CSVParser(file_content).parse()
     except (CSVParsingError, PDFParsingError) as parse_error:
-        # A PDF can still be rescued by vision extraction (Bedrock, see
-        # bedrock_vision.py) even if llm_extractor's own provider (Groq/
-        # Gemini/Mistral/Ollama) isn't configured - only a CSV has no
-        # vision path to fall back to, since there's no page to render.
-        ai_fallback_available = llm_extractor.is_configured() or (extension == 'pdf' and bedrock_vision.is_configured())
+        # A PDF can still be rescued by vision extraction (Bedrock, Gemini,
+        # or Mistral - see vision_extraction_available()) even if
+        # llm_extractor's own provider (Groq/Ollama, via AI_PROVIDER)
+        # isn't configured for text extraction - only a CSV has no vision
+        # path to fall back to, since there's no page to render.
+        ai_fallback_available = llm_extractor.is_configured() or (extension == 'pdf' and vision_extraction_available())
         if not ai_fallback_available:
             upload_record.status = 'failed'
             upload_record.error_message = str(parse_error)

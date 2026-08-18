@@ -61,7 +61,9 @@ The uploaded statement's content may contain metadata, empty rows, or non-standa
 VISION_INSTRUCTIONS = """
 
 ### Additional Instructions for Reading Images:
-You are given one or more images of bank statement pages (in reading order - read them in the order given, top to bottom, left to right within each page). Read the table exactly as printed, including numbers with commas/decimals. If a row's narration wraps across multiple lines within the same table row, treat it as one transaction, not several."""
+You are given one or more images of bank statement pages (in reading order - read them in the order given, top to bottom, left to right within each page). Read the table exactly as printed, including numbers with commas/decimals. If a row's narration wraps across multiple lines within the same table row, treat it as one transaction, not several.
+
+Column order is not fixed - some banks (e.g. SBI) print the Credit column to the LEFT of the Debit column, the opposite of the more common Debit-then-Credit order. For every row, look at which column HEADER an amount sits under, not its left/right position relative to other amounts - a value under "Credit" is always CREDIT and a value under "Debit" is always DEBIT regardless of which side of the table that column happens to be on. Only one of Credit/Debit is populated per row (the other is blank or "0" for that row); do not classify by position or default everything to one type."""
 
 
 class LLMExtractionError(Exception):
@@ -107,10 +109,11 @@ def _build_system_prompt(vision: bool = False) -> str:
     )
 
 
-def _request_and_normalize(model: str, messages: List[Dict], max_tokens: int = 16000) -> List[Dict]:
+def _request_and_normalize(model: str, messages: List[Dict], max_tokens: int = 16000, provider: str = None) -> List[Dict]:
     """Shared request/response handling for both the text and vision extraction requests below."""
+    provider = provider or ai_client.AI_PROVIDER
     try:
-        client = ai_client.get_client()
+        client = ai_client.get_client_for(provider)
         response = client.chat.completions.create(
             model=model,
             max_tokens=max_tokens,
@@ -120,7 +123,7 @@ def _request_and_normalize(model: str, messages: List[Dict], max_tokens: int = 1
     except ai_client.AIProviderError as e:
         raise LLMExtractionError(str(e))
     except Exception as e:
-        hint = ai_client.connection_hint(e)
+        hint = ai_client.connection_hint_for(provider)
         raise LLMExtractionError(f'AI extraction request failed: {e}' + (f' ({hint})' if hint else ''))
 
     choice = response.choices[0] if response.choices else None
@@ -186,7 +189,7 @@ def extract_transactions(file_content: bytes) -> List[Dict]:
     return _request_and_normalize(ai_client.get_model(), messages)
 
 
-def extract_transactions_from_images(image_pages: List[bytes]) -> List[Dict]:
+def extract_transactions_from_images(image_pages: List[bytes], provider: str = None) -> List[Dict]:
     """
     Ask a vision-capable open-source model to extract transactions
     directly from rendered bank statement page images. This is the last
@@ -199,6 +202,12 @@ def extract_transactions_from_images(image_pages: List[bytes]) -> List[Dict]:
     already being opt-in: it only runs when both the deterministic parser
     and the text-based AI fallback have nothing to work with.
 
+    By default this uses the deployment's active AI_PROVIDER, but a
+    caller can pass an explicit provider name (e.g. 'gemini', 'mistral')
+    to try a specific one regardless of AI_PROVIDER - used by main.py's
+    vision extraction fallback chain, which tries several providers in
+    turn after AWS Bedrock (see services/bedrock_vision.py) fails.
+
     Returns:
         List of transaction dicts in the same shape CSVParser produces.
 
@@ -207,15 +216,16 @@ def extract_transactions_from_images(image_pages: List[bytes]) -> List[Dict]:
         were provided, the request fails, the model declines, or no
         usable transactions come back.
     """
-    if not is_configured():
+    provider = provider or ai_client.AI_PROVIDER
+    if not ai_client.is_configured_for(provider):
         raise LLMExtractionError(
-            'AI-assisted parsing is not configured. '
+            f'AI-assisted parsing is not configured for {provider}. '
             + ai_client.not_configured_hint()
         )
     if not image_pages:
         raise LLMExtractionError('No page images were provided for vision-based extraction')
 
-    model = ai_client.get_vision_model()
+    model = ai_client.get_vision_model_for(provider)
     transactions: List[Dict] = []
     last_error: Optional[LLMExtractionError] = None
 
@@ -234,7 +244,7 @@ def extract_transactions_from_images(image_pages: List[bytes]) -> List[Dict]:
             {"role": "user", "content": content},
         ]
         try:
-            transactions.extend(_request_and_normalize(model, messages))
+            transactions.extend(_request_and_normalize(model, messages, provider=provider))
         except LLMExtractionError as e:
             last_error = e
 

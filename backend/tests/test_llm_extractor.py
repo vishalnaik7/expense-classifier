@@ -1,7 +1,7 @@
 """
 Unit tests for the LLM-based CSV extraction fallback. Never calls a real
-model - is_configured() and get_client() on services.ai_client are mocked
-directly (the provider env-var mechanics themselves are covered by
+model - is_configured_for()/get_client_for() on services.ai_client are
+mocked directly (the provider env-var mechanics themselves are covered by
 test_ai_client.py).
 """
 import hashlib
@@ -49,7 +49,7 @@ def test_extract_normalizes_llm_output(monkeypatch):
         {'date': '2026-06-02', 'description': 'Salary', 'amount': 50000.0, 'type': 'CREDIT', 'balance': 74500.5},
     ])
 
-    with patch.object(ai_client, 'get_client') as mock_get_client:
+    with patch.object(ai_client, 'get_client_for') as mock_get_client:
         mock_get_client.return_value.chat.completions.create.return_value = mock_response
         transactions = extract_transactions(b'some messy csv text')
 
@@ -69,7 +69,7 @@ def test_extract_requests_json_mode(monkeypatch):
         {'date': '2026-06-01', 'description': 'x', 'amount': 1.0, 'type': 'DEBIT', 'balance': None},
     ])
 
-    with patch.object(ai_client, 'get_client') as mock_get_client:
+    with patch.object(ai_client, 'get_client_for') as mock_get_client:
         mock_create = mock_get_client.return_value.chat.completions.create
         mock_create.return_value = mock_response
         extract_transactions(b'some csv text')
@@ -81,7 +81,7 @@ def test_extract_raises_on_content_filter(monkeypatch):
     monkeypatch.setattr(ai_client, 'is_configured', lambda: True)
     mock_response = _make_response([], finish_reason='content_filter')
 
-    with patch.object(ai_client, 'get_client') as mock_get_client:
+    with patch.object(ai_client, 'get_client_for') as mock_get_client:
         mock_get_client.return_value.chat.completions.create.return_value = mock_response
         with pytest.raises(LLMExtractionError, match='declined'):
             extract_transactions(b'some csv text')
@@ -91,7 +91,7 @@ def test_extract_raises_when_no_transactions_found(monkeypatch):
     monkeypatch.setattr(ai_client, 'is_configured', lambda: True)
     mock_response = _make_response([])
 
-    with patch.object(ai_client, 'get_client') as mock_get_client:
+    with patch.object(ai_client, 'get_client_for') as mock_get_client:
         mock_get_client.return_value.chat.completions.create.return_value = mock_response
         with pytest.raises(LLMExtractionError, match='could not find'):
             extract_transactions(b'some csv text')
@@ -104,7 +104,7 @@ def test_extract_skips_unusable_rows(monkeypatch):
         {'date': '2026-06-01', 'description': 'Valid row', 'amount': 200.0, 'type': 'DEBIT', 'balance': None},
     ])
 
-    with patch.object(ai_client, 'get_client') as mock_get_client:
+    with patch.object(ai_client, 'get_client_for') as mock_get_client:
         mock_get_client.return_value.chat.completions.create.return_value = mock_response
         transactions = extract_transactions(b'some csv text')
 
@@ -115,7 +115,7 @@ def test_extract_skips_unusable_rows(monkeypatch):
 def test_extract_wraps_connection_errors(monkeypatch):
     monkeypatch.setattr(ai_client, 'is_configured', lambda: True)
 
-    with patch.object(ai_client, 'get_client') as mock_get_client:
+    with patch.object(ai_client, 'get_client_for') as mock_get_client:
         mock_get_client.return_value.chat.completions.create.side_effect = RuntimeError('network down')
         with pytest.raises(LLMExtractionError, match='request failed'):
             extract_transactions(b'some csv text')
@@ -124,30 +124,30 @@ def test_extract_wraps_connection_errors(monkeypatch):
 def test_extract_wraps_provider_config_errors(monkeypatch):
     monkeypatch.setattr(ai_client, 'is_configured', lambda: True)
 
-    with patch.object(ai_client, 'get_client', side_effect=ai_client.AIProviderError('no GROQ_API_KEY set')):
+    with patch.object(ai_client, 'get_client_for', side_effect=ai_client.AIProviderError('no GROQ_API_KEY set')):
         with pytest.raises(LLMExtractionError, match='GROQ_API_KEY'):
             extract_transactions(b'some csv text')
 
 
 class TestExtractFromImages:
     def test_raises_when_not_configured(self, monkeypatch):
-        monkeypatch.setattr(ai_client, 'is_configured', lambda: False)
+        monkeypatch.setattr(ai_client, 'is_configured_for', lambda provider: False)
         with pytest.raises(LLMExtractionError, match='not configured'):
             extract_transactions_from_images([b'fake-png-bytes'])
 
     def test_raises_when_no_images_given(self, monkeypatch):
-        monkeypatch.setattr(ai_client, 'is_configured', lambda: True)
+        monkeypatch.setattr(ai_client, 'is_configured_for', lambda provider: True)
         with pytest.raises(LLMExtractionError, match='No page images'):
             extract_transactions_from_images([])
 
     def test_uses_vision_model_and_sends_images_as_data_uris(self, monkeypatch):
-        monkeypatch.setattr(ai_client, 'is_configured', lambda: True)
+        monkeypatch.setattr(ai_client, 'is_configured_for', lambda provider: True)
         mock_response = _make_response([
             {'date': '2026-05-05', 'description': 'ACH D- HDFC BANK LTD', 'amount': 11611.0, 'type': 'DEBIT', 'balance': 9525.05},
         ])
 
-        with patch.object(ai_client, 'get_client') as mock_get_client, \
-                patch.object(ai_client, 'get_vision_model', return_value='llama3.2-vision'):
+        with patch.object(ai_client, 'get_client_for') as mock_get_client, \
+                patch.object(ai_client, 'get_vision_model_for', return_value='llama3.2-vision'):
             mock_create = mock_get_client.return_value.chat.completions.create
             mock_create.return_value = mock_response
             transactions = extract_transactions_from_images([b'\x89PNG-page-one', b'\x89PNG-page-two'])
@@ -165,11 +165,37 @@ class TestExtractFromImages:
         for block in image_blocks:
             assert block['image_url']['url'].startswith('data:image/png;base64,')
 
+    def test_uses_explicit_provider_when_given(self, monkeypatch):
+        # main.py's vision fallback chain calls this with an explicit
+        # provider (e.g. 'gemini') regardless of the deployment's active
+        # AI_PROVIDER - both the configured-check and the client/model
+        # lookups must honor that explicit provider, not the global one.
+        monkeypatch.setattr(ai_client, 'AI_PROVIDER', 'groq')
+        seen_providers = []
+
+        def fake_is_configured_for(provider):
+            seen_providers.append(provider)
+            return True
+
+        mock_response = _make_response([
+            {'date': '2026-05-05', 'description': 'Txn A', 'amount': 100.0, 'type': 'DEBIT', 'balance': None},
+        ])
+
+        with patch.object(ai_client, 'is_configured_for', side_effect=fake_is_configured_for), \
+                patch.object(ai_client, 'get_client_for') as mock_get_client, \
+                patch.object(ai_client, 'get_vision_model_for', return_value='gemini-3.7-flash') as mock_get_vision_model:
+            mock_get_client.return_value.chat.completions.create.return_value = mock_response
+            extract_transactions_from_images([b'fake-png-bytes'], provider='gemini')
+
+        assert seen_providers == ['gemini']
+        mock_get_client.assert_called_once_with('gemini')
+        mock_get_vision_model.assert_called_once_with('gemini')
+
     def test_batches_more_than_max_images_per_request(self, monkeypatch):
         # Vision models commonly cap images per request (e.g. Groq's
         # qwen/qwen3.6-27b allows at most 3) - five page images should
         # split into two requests (3 then 2) with results merged.
-        monkeypatch.setattr(ai_client, 'is_configured', lambda: True)
+        monkeypatch.setattr(ai_client, 'is_configured_for', lambda provider: True)
         responses = [
             _make_response([
                 {'date': '2026-05-01', 'description': 'Txn A', 'amount': 100.0, 'type': 'DEBIT', 'balance': None},
@@ -179,7 +205,7 @@ class TestExtractFromImages:
             ]),
         ]
 
-        with patch.object(ai_client, 'get_client') as mock_get_client:
+        with patch.object(ai_client, 'get_client_for') as mock_get_client:
             mock_create = mock_get_client.return_value.chat.completions.create
             mock_create.side_effect = responses
             pages = [f'\x89PNG-page-{i}'.encode() for i in range(5)]
@@ -193,12 +219,12 @@ class TestExtractFromImages:
         assert {t['description'] for t in transactions} == {'Txn A', 'Txn B'}
 
     def test_partial_batch_failure_still_returns_successful_transactions(self, monkeypatch):
-        monkeypatch.setattr(ai_client, 'is_configured', lambda: True)
+        monkeypatch.setattr(ai_client, 'is_configured_for', lambda provider: True)
         ok_response = _make_response([
             {'date': '2026-05-01', 'description': 'Txn A', 'amount': 100.0, 'type': 'DEBIT', 'balance': None},
         ])
 
-        with patch.object(ai_client, 'get_client') as mock_get_client:
+        with patch.object(ai_client, 'get_client_for') as mock_get_client:
             mock_create = mock_get_client.return_value.chat.completions.create
             mock_create.side_effect = [ok_response, RuntimeError('network down')]
             pages = [f'\x89PNG-page-{i}'.encode() for i in range(5)]
@@ -208,18 +234,18 @@ class TestExtractFromImages:
         assert transactions[0]['description'] == 'Txn A'
 
     def test_raises_when_no_transactions_found(self, monkeypatch):
-        monkeypatch.setattr(ai_client, 'is_configured', lambda: True)
+        monkeypatch.setattr(ai_client, 'is_configured_for', lambda provider: True)
         mock_response = _make_response([])
 
-        with patch.object(ai_client, 'get_client') as mock_get_client:
+        with patch.object(ai_client, 'get_client_for') as mock_get_client:
             mock_get_client.return_value.chat.completions.create.return_value = mock_response
             with pytest.raises(LLMExtractionError, match='could not find'):
                 extract_transactions_from_images([b'fake-png-bytes'])
 
     def test_wraps_connection_errors(self, monkeypatch):
-        monkeypatch.setattr(ai_client, 'is_configured', lambda: True)
+        monkeypatch.setattr(ai_client, 'is_configured_for', lambda provider: True)
 
-        with patch.object(ai_client, 'get_client') as mock_get_client:
+        with patch.object(ai_client, 'get_client_for') as mock_get_client:
             mock_get_client.return_value.chat.completions.create.side_effect = RuntimeError('network down')
             with pytest.raises(LLMExtractionError, match='request failed'):
                 extract_transactions_from_images([b'fake-png-bytes'])

@@ -81,8 +81,16 @@ class AIProviderError(Exception):
 
 
 def is_configured() -> bool:
+    """Whether the active provider (AI_PROVIDER) is ready to be called."""
+    return is_configured_for(AI_PROVIDER)
+
+
+def is_configured_for(provider_name: str) -> bool:
     """
-    Whether the active provider is ready to be called.
+    Whether a specific named provider is ready to be called, regardless
+    of which one AI_PROVIDER currently points at - used when a caller
+    wants to try more than one provider explicitly (e.g. a vision
+    extraction fallback chain trying several providers in turn).
 
     Ollama needs no API key - a locally running server is all that's
     required, and if it isn't actually running, that surfaces as a clear
@@ -90,11 +98,11 @@ def is_configured() -> bool:
     check here. Every hosted provider (Groq, Gemini, Mistral) does need a
     real key, via its own env var or the generic AI_API_KEY fallback.
     """
-    if AI_PROVIDER == 'none':
+    if provider_name == 'none':
         return False
-    if AI_PROVIDER == 'ollama':
+    if provider_name == 'ollama':
         return True
-    provider = _PROVIDER_DEFAULTS.get(AI_PROVIDER)
+    provider = _PROVIDER_DEFAULTS.get(provider_name)
     if provider is None:
         return False
     return bool(os.getenv(provider['api_key_env']) or os.getenv('AI_API_KEY'))
@@ -119,15 +127,25 @@ def get_model() -> str:
 
 
 def get_vision_model() -> str:
+    """The vision-capable model name for the active provider (AI_PROVIDER), overridable via AI_VISION_MODEL."""
+    return get_vision_model_for(AI_PROVIDER)
+
+
+def get_vision_model_for(provider_name: str) -> str:
     """
-    The vision-capable model name for image-based extraction (e.g. a bank
-    statement PDF with no extractable text layer - see
+    The vision-capable model name for a specific named provider (e.g. a
+    bank statement PDF with no extractable text layer - see
     services/pdf_parser.py's render_pages_as_images()). Separate from
-    get_model(): most fast/cheap text models are not multimodal, so this
-    is deliberately a different model, overridable via AI_VISION_MODEL.
+    get_model()/get_model_for(): most fast/cheap text models are not
+    multimodal, so this is deliberately a different model. AI_VISION_MODEL
+    only overrides the currently-active AI_PROVIDER's vision model, not
+    an explicitly-named other provider's, since a fallback chain trying
+    several providers needs each one's own real default.
     """
-    default = _PROVIDER_DEFAULTS.get(AI_PROVIDER, {}).get('vision_model', 'llama3.2-vision')
-    return os.getenv('AI_VISION_MODEL', default)
+    default = _PROVIDER_DEFAULTS.get(provider_name, {}).get('vision_model', 'llama3.2-vision')
+    if provider_name == AI_PROVIDER:
+        return os.getenv('AI_VISION_MODEL', default)
+    return default
 
 
 def get_client() -> OpenAI:
@@ -137,28 +155,44 @@ def get_client() -> OpenAI:
     through this function instead of constructing one directly, so
     switching providers is a config change, not a code change.
     """
-    if AI_PROVIDER == 'ollama':
+    return get_client_for(AI_PROVIDER)
+
+
+def get_client_for(provider_name: str) -> OpenAI:
+    """
+    An OpenAI-compatible client for a specific named provider, regardless
+    of which one AI_PROVIDER currently points at - used when a caller
+    wants to try more than one provider explicitly (e.g. a vision
+    extraction fallback chain trying several providers in turn).
+    """
+    if provider_name == 'ollama':
         base_url = os.getenv('AI_BASE_URL', _PROVIDER_DEFAULTS['ollama']['base_url'])
         return OpenAI(base_url=base_url, api_key='ollama')  # Ollama ignores the key; the SDK requires a non-empty string
 
-    provider = _PROVIDER_DEFAULTS.get(AI_PROVIDER)
+    provider = _PROVIDER_DEFAULTS.get(provider_name)
     if provider is not None:
         api_key = os.getenv(provider['api_key_env']) or os.getenv('AI_API_KEY')
         if not api_key:
-            raise AIProviderError(f"AI_PROVIDER={AI_PROVIDER} but no {provider['api_key_env']} (or AI_API_KEY) is set")
-        base_url = os.getenv('AI_BASE_URL', provider['base_url'])
+            raise AIProviderError(f"provider={provider_name} but no {provider['api_key_env']} (or AI_API_KEY) is set")
+        base_url = os.getenv('AI_BASE_URL') if provider_name == AI_PROVIDER else None
+        base_url = base_url or provider['base_url']
         return OpenAI(base_url=base_url, api_key=api_key)
 
     raise AIProviderError(
-        f'Unknown AI_PROVIDER "{AI_PROVIDER}" - expected "ollama", "groq", "gemini", or "mistral" (or "none" to disable AI features)'
+        f'Unknown provider "{provider_name}" - expected "ollama", "groq", "gemini", or "mistral" (or "none" to disable AI features)'
     )
 
 
 def connection_hint(error: Exception) -> Optional[str]:
     """A friendlier hint appended to raw connection errors, based on the active provider."""
-    if AI_PROVIDER == 'ollama':
+    return connection_hint_for(AI_PROVIDER)
+
+
+def connection_hint_for(provider_name: str) -> Optional[str]:
+    """A friendlier hint appended to raw connection errors, for a specific named provider."""
+    if provider_name == 'ollama':
         return 'Is Ollama running locally? Start it with `ollama serve` and make sure the model is pulled (`ollama pull llama3.1`).'
-    provider = _PROVIDER_DEFAULTS.get(AI_PROVIDER)
+    provider = _PROVIDER_DEFAULTS.get(provider_name)
     if provider is not None:
-        return f"Check that {provider['api_key_env']} is valid and {AI_PROVIDER.capitalize()} is reachable."
+        return f"Check that {provider['api_key_env']} is valid and {provider_name.capitalize()} is reachable."
     return None

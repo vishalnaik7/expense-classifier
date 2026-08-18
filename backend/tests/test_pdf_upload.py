@@ -6,6 +6,8 @@ same endpoint CSV uploads go through, now branching on file extension.
 import io
 from unittest.mock import patch
 
+import pytest
+
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.utils import ImageReader
@@ -230,3 +232,79 @@ def test_upload_warns_when_nova_lite_fallback_model_was_used(client, auth_header
     assert body['data']['used_fallback_model'] is True
     assert 'Nova Lite' in body['data']['upload']['error_message']
     assert 'double-check' in body['data']['upload']['error_message']
+
+
+class TestVisionFallbackChain:
+    """
+    Unit tests for _vision_extract_with_fallbacks() and
+    vision_extraction_available() directly - the chain that tries AWS
+    Bedrock (Claude, then Nova Lite) first, then Gemini and Mistral via
+    ai_client, used by both branches of _ai_fallback_parse().
+    """
+
+    def test_uses_bedrock_result_when_it_succeeds(self, monkeypatch):
+        with patch.object(main_module.bedrock_vision, 'extract_transactions_from_images', return_value=([{'d': 1}], False)) as mock_bedrock, \
+                patch.object(main_module.llm_extractor, 'extract_transactions_from_images') as mock_llm_extractor:
+            transactions, used_fallback_model = main_module._vision_extract_with_fallbacks([b'page'])
+
+        assert transactions == [{'d': 1}]
+        assert used_fallback_model is False
+        mock_bedrock.assert_called_once()
+        mock_llm_extractor.assert_not_called()
+
+    def test_falls_back_to_gemini_when_bedrock_fails(self, monkeypatch):
+        monkeypatch.setattr(main_module.ai_client, 'is_configured_for', lambda provider: provider == 'gemini')
+
+        with patch.object(main_module.bedrock_vision, 'extract_transactions_from_images', side_effect=main_module.LLMExtractionError('bedrock down')), \
+                patch.object(main_module.llm_extractor, 'extract_transactions_from_images', return_value=[{'d': 1}]) as mock_llm_extractor:
+            transactions, used_fallback_model = main_module._vision_extract_with_fallbacks([b'page'])
+
+        assert transactions == [{'d': 1}]
+        assert used_fallback_model is True
+        mock_llm_extractor.assert_called_once_with([b'page'], provider='gemini')
+
+    def test_falls_back_to_mistral_when_bedrock_and_gemini_fail(self, monkeypatch):
+        monkeypatch.setattr(main_module.ai_client, 'is_configured_for', lambda provider: provider in ('gemini', 'mistral'))
+
+        def fake_extract(images, provider):
+            if provider == 'gemini':
+                raise main_module.LLMExtractionError('gemini down')
+            return [{'d': 'from mistral'}]
+
+        with patch.object(main_module.bedrock_vision, 'extract_transactions_from_images', side_effect=main_module.LLMExtractionError('bedrock down')), \
+                patch.object(main_module.llm_extractor, 'extract_transactions_from_images', side_effect=fake_extract):
+            transactions, used_fallback_model = main_module._vision_extract_with_fallbacks([b'page'])
+
+        assert transactions == [{'d': 'from mistral'}]
+        assert used_fallback_model is True
+
+    def test_skips_unconfigured_fallback_providers(self, monkeypatch):
+        monkeypatch.setattr(main_module.ai_client, 'is_configured_for', lambda provider: False)
+
+        with patch.object(main_module.bedrock_vision, 'extract_transactions_from_images', side_effect=main_module.LLMExtractionError('bedrock down')), \
+                patch.object(main_module.llm_extractor, 'extract_transactions_from_images') as mock_llm_extractor:
+            with pytest.raises(main_module.LLMExtractionError, match='bedrock down'):
+                main_module._vision_extract_with_fallbacks([b'page'])
+
+        mock_llm_extractor.assert_not_called()
+
+    def test_raises_last_error_when_every_tier_fails(self, monkeypatch):
+        monkeypatch.setattr(main_module.ai_client, 'is_configured_for', lambda provider: True)
+
+        def fake_extract(images, provider):
+            raise main_module.LLMExtractionError(f'{provider} failed')
+
+        with patch.object(main_module.bedrock_vision, 'extract_transactions_from_images', side_effect=main_module.LLMExtractionError('bedrock failed')), \
+                patch.object(main_module.llm_extractor, 'extract_transactions_from_images', side_effect=fake_extract):
+            with pytest.raises(main_module.LLMExtractionError, match='mistral failed'):
+                main_module._vision_extract_with_fallbacks([b'page'])
+
+    def test_vision_extraction_available_true_when_any_tier_configured(self, monkeypatch):
+        monkeypatch.setattr(main_module.bedrock_vision, 'is_configured', lambda: False)
+        monkeypatch.setattr(main_module.ai_client, 'is_configured_for', lambda provider: provider == 'mistral')
+        assert main_module.vision_extraction_available() is True
+
+    def test_vision_extraction_available_false_when_nothing_configured(self, monkeypatch):
+        monkeypatch.setattr(main_module.bedrock_vision, 'is_configured', lambda: False)
+        monkeypatch.setattr(main_module.ai_client, 'is_configured_for', lambda provider: False)
+        assert main_module.vision_extraction_available() is False
