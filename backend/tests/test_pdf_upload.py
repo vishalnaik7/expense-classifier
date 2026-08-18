@@ -252,6 +252,25 @@ class TestVisionFallbackChain:
         mock_bedrock.assert_called_once()
         mock_llm_extractor.assert_not_called()
 
+    def test_prefers_bigger_result_when_bedrocks_own_fallback_weakly_succeeds(self, monkeypatch):
+        # The scenario this heuristic exists for: bedrock_vision doesn't
+        # raise at all (Nova Lite returned something), but a later
+        # provider's result is far more complete - the naive "stop at
+        # first success" chain would have silently kept the worse one.
+        monkeypatch.setattr(main_module.ai_client, 'is_configured_for', lambda provider: provider == 'mistral')
+
+        def fake_extract(images, provider):
+            assert provider == 'mistral'
+            return [{'d': 1}, {'d': 2}, {'d': 3}]
+
+        with patch.object(main_module.bedrock_vision, 'extract_transactions_from_images', return_value=([{'d': 'nova-lite-only-one'}], True)), \
+                patch.object(main_module.llm_extractor, 'extract_transactions_from_images', side_effect=fake_extract):
+            transactions, used_fallback_model = main_module._vision_extract_with_fallbacks([b'page'])
+
+        assert used_fallback_model is True
+        assert len(transactions) == 3
+        assert transactions[0]['d'] == 1
+
     def test_falls_back_to_gemini_when_bedrock_fails(self, monkeypatch):
         monkeypatch.setattr(main_module.ai_client, 'is_configured_for', lambda provider: provider == 'gemini')
 

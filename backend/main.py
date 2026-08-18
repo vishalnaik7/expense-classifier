@@ -559,20 +559,42 @@ def vision_extraction_available() -> bool:
 def _vision_extract_with_fallbacks(images):
     """
     Tries AWS Bedrock first (Claude, then Nova Lite - see
-    bedrock_vision.py), then each provider in _VISION_FALLBACK_PROVIDERS,
-    stopping at the first success. Every tier after Claude is
-    lower-confidence (see bedrock_vision's docstring on Nova Lite's
-    observed reliability gap on real statements) - used_fallback_model is
-    True for any of them, same contract as
-    bedrock_vision.extract_transactions_from_images().
+    bedrock_vision.py). If Claude itself succeeds, that result is
+    trusted and returned immediately. Otherwise - Bedrock failed
+    outright, or only succeeded via its own Nova Lite fallback - every
+    provider in _VISION_FALLBACK_PROVIDERS is also tried (not just the
+    first one that doesn't error), and the result with the most
+    transactions wins.
+
+    This "keep trying and pick the biggest result" approach exists
+    because a lower-confidence model failing loudly (an exception) isn't
+    the only failure mode worth working around - in testing, Nova Lite
+    returned a plausible-looking but badly incomplete/inaccurate result
+    on a real statement without raising at all, which a naive
+    first-success chain would have silently accepted over a
+    fuller/better result from a later provider. Transaction count is an
+    imperfect proxy for accuracy, but it is what's available without a
+    ground truth to check against - the used_fallback_model=True warning
+    this triggers is what actually protects the user, not this
+    heuristic.
+
+    Every tier after Claude is lower-confidence (see bedrock_vision's
+    docstring on Nova Lite's observed reliability gap on real
+    statements) - used_fallback_model is True for any of them, same
+    contract as bedrock_vision.extract_transactions_from_images().
 
     Raises:
         LLMExtractionError: from the last tier attempted, if every
         configured tier failed (or none were configured).
     """
     last_error = None
+    best_result = None
+
     try:
-        return bedrock_vision.extract_transactions_from_images(images)
+        transactions, used_fallback_model = bedrock_vision.extract_transactions_from_images(images)
+        if not used_fallback_model:
+            return transactions, False
+        best_result = transactions
     except LLMExtractionError as e:
         last_error = e
 
@@ -580,9 +602,15 @@ def _vision_extract_with_fallbacks(images):
         if not ai_client.is_configured_for(provider):
             continue
         try:
-            return llm_extractor.extract_transactions_from_images(images, provider=provider), True
+            transactions = llm_extractor.extract_transactions_from_images(images, provider=provider)
         except LLMExtractionError as e:
             last_error = e
+            continue
+        if best_result is None or len(transactions) > len(best_result):
+            best_result = transactions
+
+    if best_result is not None:
+        return best_result, True
 
     raise last_error or LLMExtractionError('No vision-capable AI provider is configured')
 
